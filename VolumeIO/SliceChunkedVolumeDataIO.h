@@ -34,7 +34,7 @@ namespace parallel_mesh_extractor {
   protected:
     SliceChunkedVolumeDataIO() = default;
 
-  private:
+  protected:
     std::filesystem::path volumeDataFilePath;
     VolumeMetaData metaData;
   };

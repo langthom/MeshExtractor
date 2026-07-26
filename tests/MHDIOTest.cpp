@@ -32,14 +32,15 @@ namespace {
   public:
 
     ConstructTemporaryMHDFile(
-      char writeMask         = 0xFF,
-      std::string mhdName    = "test",
-      std::string volName    = "test",
+      char writeMask                                   = 0xFF,
+      std::string mhdName                              = "test",
+      std::string volName                              = "test",
       parallel_mesh_extractor::VolumeMetaData metaData = parallel_mesh_extractor::VolumeMetaData{},
-      size_t payloadSize     = 1,
-      int offset             = 0,
-      std::string objectType = "Image",
-      int ndims              = 3
+      size_t payloadSize                               = 1,
+      int offset                                       = 0,
+      std::string objectType                           = "Image",
+      int ndims                                        = 3,
+      std::string auxiliaryLine                        = ""
     ) {
       auto tempFilePath = std::filesystem::temp_directory_path();
       this->mhdPath = tempFilePath / (mhdName + ".mhd");
@@ -51,14 +52,14 @@ namespace {
       auto et = pme::DISPATCH_VOXEL_TYPE(SupportedVoxelTypes, metaData.voxelType, voxelTypeString);
 
       std::ostringstream metaStr;
-      if (writeMask & 0x01) metaStr << "ObjectType      = " << objectType << "\n";
-      if (writeMask & 0x02) metaStr << "NDims           = " << ndims << "\n";
-      if (writeMask & 0x04) metaStr << "BinaryData      = True\n";
-      if (writeMask & 0x08) metaStr << "Offset          = " << offset << "\n";
-      if (writeMask & 0x10) metaStr << "ElementSpacing  = " << metaData.spacing[0] << " " << metaData.spacing[1] << " " << metaData.spacing[2] << "\n";
-      if (writeMask & 0x20) metaStr << "DimSize         = " << metaData.dim[0] << " " << metaData.dim[1] << " " << metaData.dim[2] << "\n";
-      if (writeMask & 0x40) metaStr << "ElementType     = " << et << "\n";
-      if (writeMask & 0x80) metaStr << "ElementDataFile = " << this->volPath << "\n";
+      if (writeMask & 0x01) metaStr << "ObjectType      = " << objectType << '\n';
+      if (writeMask & 0x02) metaStr << "NDims           = " << ndims      << '\n';
+      if (writeMask & 0x08) metaStr << "Offset          = " << offset << '\n';
+      if (writeMask & 0x10) metaStr << "ElementSpacing  = " << metaData.spacing[0] << ' ' << metaData.spacing[1] << ' ' << metaData.spacing[2] << '\n';
+      if (writeMask & 0x20) metaStr << "DimSize         = " << metaData.dim[0]     << ' ' << metaData.dim[1]     << ' ' << metaData.dim[2]     << '\n';
+      if (writeMask & 0x40) metaStr << "ElementType     = " << et << '\n';
+      if (writeMask & 0x80) metaStr << "ElementDataFile = " << this->volPath << '\n';
+      if (auxiliaryLine != "")  metaStr << auxiliaryLine << '\n';
 
       std::ofstream mhdFile{this->mhdPath};
       mhdFile << metaStr.str();
@@ -96,11 +97,19 @@ TEST_CASE("MHD meta data parsing fails") {
   scmhd.SetFilePath("blablubb.mhd");
   CHECK_THROWS_AS(scmhd.ReadMetaData(), std::filesystem::filesystem_error const&);
 
+  // Case 1.5: Malformed file.
+  {
+    auto tmpMHD = ConstructTemporaryMHDFile(0xFF, mhd, vol, vmd, 1, 0, "Image", 3, "blubb");
+    auto mhdIO  = parallel_mesh_extractor::SliceChunkedMHDIO();
+    mhdIO.SetFilePath(tmpMHD.GetMHDPath());
+    CHECK_THROWS_AS(mhdIO.ReadMetaData(), std::runtime_error const&);
+  }
+
   auto missingMetaDataElementTest = [](char mask) {
     auto tmpMHD = ConstructTemporaryMHDFile(mask);
     auto mhdIO  = parallel_mesh_extractor::SliceChunkedMHDIO();
     mhdIO.SetFilePath(tmpMHD.GetMHDPath());
-    CHECK_THROWS_AS(mhdIO.ReadMetaData(), std::filesystem::filesystem_error const&);
+    CHECK_THROWS_AS(mhdIO.ReadMetaData(), std::runtime_error const&);
   };
 
   // Case 2: No ObjectType is given.
