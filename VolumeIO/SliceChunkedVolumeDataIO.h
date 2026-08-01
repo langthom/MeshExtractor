@@ -12,7 +12,7 @@ namespace parallel_mesh_extractor {
   class SliceChunkedVolumeDataIO {
   public:
 
-    using BufferType = std::unique_ptr<float>;
+    using BufferType = std::unique_ptr<float[]>;
 
     void SetFilePath(std::filesystem::path const& volumeDataFilePath) {
       this->volumeDataFilePath = volumeDataFilePath;
@@ -27,8 +27,8 @@ namespace parallel_mesh_extractor {
       return this->metaData;
     }
 
-    BufferType ReadSlices(unsigned int begin, unsigned int end) const {
-      return static_cast<DerivedIO*>(this)->ReadSlicesImpl(begin, end);
+    BufferType ReadSlices(unsigned int begin, unsigned int numberOfSlices) const {
+      return static_cast<DerivedIO const*>(this)->ReadSlicesImpl(begin, numberOfSlices);
     }
 
   protected:

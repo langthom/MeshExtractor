@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
@@ -6,8 +7,6 @@
 #include <optional>
 #include <string_view>
 #include "SliceChunkedMHDIO.h"
-
-#include <iostream>
 
 namespace impl {
   using KeyValues = std::pair<std::string_view, std::vector<std::string_view>>;
@@ -36,6 +35,12 @@ namespace impl {
       impl::parseNumeric<T, EnforceGTZero>(svs[i], values[i]);
     }
     maskValue |= Mask;
+  }
+
+  template<class VoxelType>
+  void CastArrayToFloat(float* target, char const* source, size_t numElements) {
+    VoxelType const* s = reinterpret_cast<VoxelType const*>(source);
+    std::transform(s, s + numElements, target, [](VoxelType const x){ return static_cast<float>(x); });
   }
 }
 
@@ -104,7 +109,6 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
       requiredEntriesGiven |= 0x20;
     } else if (key == "ElementDataFile") {
       this->volumeDataFilePath = values.front();
-      std::cout << "path: " << this->volumeDataFilePath << "\n";
       requiredEntriesGiven |= 0x40;
     } else {
       // Additional potentially valid but ignored MHD key-value pair.
@@ -130,9 +134,38 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
 }
  
 
-Buffer parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesImpl(unsigned int begin, unsigned int end) const {
-  // If 
-  return nullptr;
+Buffer parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesImpl(unsigned int begin, unsigned int numberOfSlices) const {
+  // In MHD, there may be metadata stored at the beginning of the file up to the specified offset
+  // in bytes (which is zero by default). After that, the data is stored as contiguous block of data.
+
+  if (begin                  >= this->metaData.dim[2]) { return nullptr; }
+  if (begin + numberOfSlices >  this->metaData.dim[2]) { return nullptr; }
+  if (numberOfSlices         >  this->metaData.dim[2]) { return nullptr; }
+  if (numberOfSlices         ==                     0) { return nullptr; }
+
+  auto const sliceSize      = this->metaData.dim[0] * this->metaData.dim[1];
+  auto const elementSize    = this->metaData.GetElementSizeInBytes();
+  auto const sliceSizeBytes = sliceSize * elementSize;
+
+
+  std::ifstream mhdFile{this->volumeDataFilePath, std::ios::binary};
+  if (!mhdFile.seekg(this->offset + begin * sliceSizeBytes, std::ios::beg)) {
+    return nullptr;
+  }
+
+  auto rawBuffer = std::make_unique<char[]>(numberOfSlices * sliceSizeBytes);
+  if (!mhdFile.read(rawBuffer.get(), numberOfSlices * sliceSizeBytes)) {
+    return nullptr;
+  }
+
+  Buffer buffer{ new Buffer::element_type[numberOfSlices * sliceSize] };
+  parallel_mesh_extractor::DISPATCH_VOXEL_TYPE(
+    parallel_mesh_extractor::ALL_VOXEL_TYPES,
+    this->metaData.voxelType,
+    impl::CastArrayToFloat,
+    buffer.get(), rawBuffer.get(), numberOfSlices * sliceSize
+  );
+  return buffer;
 }
 
 // ---------------------------------------------------------------------------------------------- //

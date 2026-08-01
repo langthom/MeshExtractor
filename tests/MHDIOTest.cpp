@@ -177,10 +177,79 @@ TEST_CASE("MHD meta data parsing succeeds") {
 }
 
 TEST_CASE("MHD volume reading fails") {
-  CHECK(false);
+  parallel_mesh_extractor::VolumeMetaData vmd;
+  vmd.dim       = {2, 3, 4};
+  vmd.spacing   = {0.01, 0.01, 0.01};
+  vmd.voxelType = parallel_mesh_extractor::VoxelType::UINT16;
+
+  std::vector<std::pair<unsigned int, unsigned int>> invalidSliceSpecs{
+    {4, 0}, {4, 1}, {5, 0}, {5, 1},
+    {0, 0}, {1, 0}, {2, 0}, {3, 0},
+    {0, 5}, {0, 6}, {1, 4}, {1, 5},
+    {2, 3}, {2, 4}, {3, 2}, {3, 3},
+  };
+
+  for (int offset : {0, 2048}) {
+    auto size = vmd.GetNumberOfVoxels();
+    auto expectedBuffer = std::make_unique<std::uint16_t[]>(size);
+    fillBuffer<std::uint16_t>(reinterpret_cast<char*>(expectedBuffer.get()), size);
+
+    auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, size, offset, "Image", 3, "");
+    auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+    mhdIO.SetFilePath(mhd.GetMHDPath());
+    CHECK_NOTHROW(mhdIO.ReadMetaData());
+
+    for (auto const [beg, num] : invalidSliceSpecs) {
+      CHECK_EQ(nullptr, mhdIO.ReadSlices(beg, num));
+    }
+  }
 }
 
 TEST_CASE("MHD volume reading succeeds") {
-  CHECK(false);
+  parallel_mesh_extractor::VolumeMetaData vmd;
+  vmd.dim       = {2, 3, 4};
+  vmd.spacing   = {0.01, 0.01, 0.01};
+  vmd.voxelType = parallel_mesh_extractor::VoxelType::UINT16;
+
+  // Case 1: Create and read a small entire volume (i.e., all slices in primary dimension) at a given offset.
+  for (int offset : {0, 2048}) {
+    auto size = vmd.GetNumberOfVoxels();
+    auto expectedBuffer = std::make_unique<std::uint16_t[]>(size);
+    fillBuffer<std::uint16_t>(reinterpret_cast<char*>(expectedBuffer.get()), size);
+
+    auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, size, offset, "Image", 3, "");
+    auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+    mhdIO.SetFilePath(mhd.GetMHDPath());
+    CHECK_NOTHROW(mhdIO.ReadMetaData());
+
+    auto numberOfSlices = mhdIO.GetMetaData().dim[2];
+    auto readBuffer = mhdIO.ReadSlices(0, numberOfSlices);
+    CHECK(readBuffer != nullptr);
+
+    for (int i = 0; i < size; ++i) {
+      CHECK_EQ(expectedBuffer[i], readBuffer[i]);
+    }
+  }
+
+  // Case 2: Read only a single slice.
+  auto sliceSize      = vmd.dim[0] * vmd.dim[1];
+  auto size           = vmd.GetNumberOfVoxels();
+  auto expectedBuffer = std::make_unique<std::uint16_t[]>(size);
+  fillBuffer<std::uint16_t>(reinterpret_cast<char*>(expectedBuffer.get()), size);
+
+  auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, size, 0, "Image", 3, "");
+  auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+  mhdIO.SetFilePath(mhd.GetMHDPath());
+  CHECK_NOTHROW(mhdIO.ReadMetaData());
+
+  for (unsigned int start : {0, 1, 2, 3}) {
+    auto readBuffer = mhdIO.ReadSlices(start, 1);
+    CHECK(readBuffer != nullptr);
+    auto expectedSlice = expectedBuffer.get() + start * sliceSize;
+
+    for (int i = 0; i < sliceSize; ++i) {
+      CHECK_EQ(expectedSlice[i], readBuffer[i]);
+    }
+  }
 }
 
