@@ -149,6 +149,8 @@ namespace parallel_mesh_extractor {
     std::array<std::size_t, 3> ComputeOffsets(void) const;
 
     size_t GetElementSizeInBytes(void) const;
+
+    std::uintmax_t GetNumberOfVoxels(void) const;
   };
 
 } // namespace parallel_mesh_extractor

@@ -7,6 +7,8 @@
 #include <string_view>
 #include "SliceChunkedMHDIO.h"
 
+#include <iostream>
+
 namespace impl {
   using KeyValues = std::pair<std::string_view, std::vector<std::string_view>>;
   std::optional<KeyValues> parseMHDLine(std::string_view line);
@@ -99,17 +101,31 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
         throw std::runtime_error("Unrecognized element type.");
       }
       this->metaData.voxelType = it->second;
-      requiredEntriesGiven |= 0x40;
+      requiredEntriesGiven |= 0x20;
     } else if (key == "ElementDataFile") {
       this->volumeDataFilePath = values.front();
-      requiredEntriesGiven |= 0x80;
+      std::cout << "path: " << this->volumeDataFilePath << "\n";
+      requiredEntriesGiven |= 0x40;
     } else {
       // Additional potentially valid but ignored MHD key-value pair.
     }
   }
 
-  if (requiredEntriesGiven != 0x7f) {
+  if (requiredEntriesGiven != 0x7F) {
     throw std::runtime_error("Missing data field");
+  }
+
+  // Test the existance of the linked data file and check that its size maches the meta data.
+  if (!std::filesystem::exists(this->volumeDataFilePath)) {
+    throw std::runtime_error("Volume data file does not exists.");
+  }
+  
+  std::uintmax_t const dataSize     = std::filesystem::file_size(this->volumeDataFilePath);
+  std::uintmax_t const expectedSize = 
+    this->metaData.GetNumberOfVoxels() * this->metaData.GetElementSizeInBytes() + this->offset;
+
+  if (dataSize != expectedSize) {
+    throw std::runtime_error("Meta data does not match the size of the data file.");
   }
 }
  
@@ -123,10 +139,10 @@ Buffer parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesImpl(unsigned int b
 
 std::optional<impl::KeyValues> impl::parseMHDLine(std::string_view line) {
   auto trim = [](std::string_view str) -> std::string_view {
-    while (!str.empty() && std::isspace(str.front())) {
+    while (!str.empty() && (std::isspace(str.front()) || str.front() == '\"')) {
       str.remove_prefix(1);
     }
-    while (!str.empty() && std::isspace(str.back())) {
+    while (!str.empty() && (std::isspace(str.back()) || str.back() == '\"')) {
       str.remove_suffix(1);
     }
     return str;

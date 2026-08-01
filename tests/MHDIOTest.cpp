@@ -6,6 +6,8 @@
 #include "doctest.h"
 #include "../VolumeIO/SliceChunkedMHDIO.h"
 
+#include <iostream>
+
 namespace {
   template<class VoxelType> std::string voxelTypeString();
   template<> std::string voxelTypeString<std::int8_t  >() { return "MET_CHAR";   }
@@ -35,7 +37,7 @@ namespace {
       char writeMask                                   = 0xFF,
       std::string mhdName                              = "test",
       std::string volName                              = "test",
-      parallel_mesh_extractor::VolumeMetaData metaData = parallel_mesh_extractor::VolumeMetaData{},
+      parallel_mesh_extractor::VolumeMetaData metaData = ConstructTemporaryMHDFile::DefaultMetaData(),
       size_t payloadSize                               = 1,
       int offset                                       = 0,
       std::string objectType                           = "Image",
@@ -54,24 +56,24 @@ namespace {
       std::ostringstream metaStr;
       if (writeMask & 0x01) metaStr << "ObjectType      = " << objectType << '\n';
       if (writeMask & 0x02) metaStr << "NDims           = " << ndims      << '\n';
-      if (writeMask & 0x08) metaStr << "Offset          = " << offset << '\n';
-      if (writeMask & 0x10) metaStr << "ElementSpacing  = " << metaData.spacing[0] << ' ' << metaData.spacing[1] << ' ' << metaData.spacing[2] << '\n';
-      if (writeMask & 0x20) metaStr << "DimSize         = " << metaData.dim[0]     << ' ' << metaData.dim[1]     << ' ' << metaData.dim[2]     << '\n';
-      if (writeMask & 0x40) metaStr << "ElementType     = " << et << '\n';
-      if (writeMask & 0x80) metaStr << "ElementDataFile = " << this->volPath << '\n';
+      if (writeMask & 0x04) metaStr << "Offset          = " << offset << '\n';
+      if (writeMask & 0x08) metaStr << "ElementSpacing  = " << metaData.spacing[0] << ' ' << metaData.spacing[1] << ' ' << metaData.spacing[2] << '\n';
+      if (writeMask & 0x10) metaStr << "DimSize         = " << metaData.dim[0]     << ' ' << metaData.dim[1]     << ' ' << metaData.dim[2]     << '\n';
+      if (writeMask & 0x20) metaStr << "ElementType     = " << et << '\n';
+      if (writeMask & 0x40) metaStr << "ElementDataFile = " << this->volPath << '\n';
       if (auxiliaryLine != "")  metaStr << auxiliaryLine << '\n';
 
       std::ofstream mhdFile{this->mhdPath};
       mhdFile << metaStr.str();
       
       if (writeMask & 0x80) {
-        auto buf = std::make_unique<char[]>(payloadSize * metaData.GetElementSizeInBytes());
+        auto buf = std::make_unique<char[]>(payloadSize * metaData.GetElementSizeInBytes() + offset);
         parallel_mesh_extractor::DISPATCH_VOXEL_TYPE(parallel_mesh_extractor::ALL_VOXEL_TYPES,
                                                      metaData.voxelType, fillBuffer,
-                                                     buf.get(), payloadSize);
+                                                     buf.get() + offset, payloadSize);
       
         std::ofstream volFile{this->volPath, std::ios::binary};
-        volFile.write(buf.get(), payloadSize * metaData.GetElementSizeInBytes());
+        volFile.write(buf.get(), payloadSize * metaData.GetElementSizeInBytes() + offset);
       }
     }
 
@@ -83,6 +85,14 @@ namespace {
     std::filesystem::path GetMHDPath(void) const {
       return this->mhdPath;
     }
+
+    static parallel_mesh_extractor::VolumeMetaData DefaultMetaData(void) {
+      parallel_mesh_extractor::VolumeMetaData vmd;
+      vmd.dim       = {1, 1, 1};
+      vmd.spacing   = {1, 1, 1};
+      vmd.voxelType = parallel_mesh_extractor::VoxelType::UINT16;
+      return vmd;
+    }
   };
 
 } // anonymous namespace
@@ -90,64 +100,80 @@ namespace {
 TEST_CASE("MHD meta data parsing fails") {
   std::string mhd = "test";
   std::string vol = "test";
-  parallel_mesh_extractor::VolumeMetaData vmd;
+  parallel_mesh_extractor::VolumeMetaData vmd = ConstructTemporaryMHDFile::DefaultMetaData();
 
   // Case 1: The requested MHD file does not exist.
   parallel_mesh_extractor::SliceChunkedMHDIO scmhd;
   scmhd.SetFilePath("blablubb.mhd");
   CHECK_THROWS_AS(scmhd.ReadMetaData(), std::filesystem::filesystem_error const&);
 
-  // Case 1.5: Malformed file.
-  {
-    auto tmpMHD = ConstructTemporaryMHDFile(0xFF, mhd, vol, vmd, 1, 0, "Image", 3, "blubb");
+  auto testFile = [&vmd](auto&&... args) {
+    auto tmpMHD = ConstructTemporaryMHDFile(args...);
     auto mhdIO  = parallel_mesh_extractor::SliceChunkedMHDIO();
     mhdIO.SetFilePath(tmpMHD.GetMHDPath());
     CHECK_THROWS_AS(mhdIO.ReadMetaData(), std::runtime_error const&);
-  }
-
-  auto missingMetaDataElementTest = [](char mask) {
-    auto tmpMHD = ConstructTemporaryMHDFile(mask);
-    auto mhdIO  = parallel_mesh_extractor::SliceChunkedMHDIO();
-    mhdIO.SetFilePath(tmpMHD.GetMHDPath());
-    CHECK_THROWS_AS(mhdIO.ReadMetaData(), std::runtime_error const&);
+    vmd = parallel_mesh_extractor::VolumeMetaData{};
   };
 
-  // Case 2: No ObjectType is given.
-  missingMetaDataElementTest(0xfe);
- 
-  // Case 3: ObjectType is given but is not image.
+  // Case 2: Malformed file.
+  // -- Non Key=Value line.
+  testFile(0x7F, mhd, vol, vmd, 1, 0, "Image", 3, "blubb");
+  // -- No ObjectType is given.
+  testFile(0x7E);
+  // -- No NDims given.
+  testFile(0x7D);
+  // -- No ElementSpacing given.
+  testFile(0x7B);
+  // -- No DimSize given.
+  testFile(0x77);
+  // -- No ElementType given.
+  testFile(0x6F);
+  // -- No ElementDataFile given.
+  testFile(0x5F);
+
+  // Case 3: File form is good but elements are invalid.
+  // -- ObjectType is not "Image".
+  testFile(0x7F, mhd, vol, vmd, 1, 0, "Invalid", 3, "");
+  // -- NDims is not equal to 3.
+  testFile(0x7F, mhd, vol, vmd, 1, 0, "Image", 2, "");
+  // -- ElementSpacing is not positive.
+  auto spacings = std::vector<std::array<float, 3>>{
+    {-1, -1, -1}, {0, -1, -1}, {-1, 0, -1}, {-1, -1, 0}, {0, 0, -1}, {0, -1, 0}, {-1, 0, 0},
+    {0, 1, 1}, {1, 0, 1}, {1, 1, 0}
+  };
+  for (auto spacing : spacings) {
+    vmd.spacing = spacing;
+    testFile(0x7F, mhd, vol, vmd, 1, 0, "Image", 3, "");
+  }
+  // -- ElementType is invalid.
+  vmd.voxelType = static_cast<parallel_mesh_extractor::VoxelType>(0);
+  testFile(0x7F, mhd, vol, vmd, 1, 0, "Image", 3, "");
   
-  // Case 4: NDims is not given.
-  missingMetaDataElementTest(0xfd);
-
-  // Case 5: NDims is given but is not equal to 3.
-
-  // Case 6: No ElementSpacing is given.
-  missingMetaDataElementTest(0xef);
-
-  // Case 7: ElementSpacing is given but spacing is invalid (negative or zero on any axis).
-  
-  // Case 8: No DimSize is given.
-  missingMetaDataElementTest(0xdf);
-
-  // Case 9: DimSize is given but is invalid (zero on any axis).
-  
-  // Case 10: No ElementType is given.
-  missingMetaDataElementTest(0xbf);
-
-  // Case 11: ElementType is given but is invalid.
-  
-  // Case 12: No ElementDataFile is given.
-  missingMetaDataElementTest(0x7f);
-
-  // Case 13: ElementDataFile is given but does not exist.
-  
-  // Case 14: The size of the ElementDataFile does not correspond to the product of DimSize + Offset
-
+  // Case 4: Regarding the linked data file.
+  // -- ElementDataFile does not exist.
+  testFile(0x7F, mhd, "non existing file", vmd, 1, 0, "Image", 3, "");
+  // -- The size of the ElementDataFile does not match the meta data.
+  testFile(0xFF, mhd, vol, vmd, 17, 0, "Image", 3, "");
 }
 
 TEST_CASE("MHD meta data parsing succeeds") {
-  CHECK(false);
+  parallel_mesh_extractor::VolumeMetaData vmd;
+  vmd.dim       = {2, 3, 4};
+  vmd.spacing   = {0.01, 0.01, 0.01};
+  vmd.voxelType = parallel_mesh_extractor::VoxelType::UINT16;
+
+  auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, 2*3*4, 0, "Image", 3, "");
+  auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+  mhdIO.SetFilePath(mhd.GetMHDPath());
+
+  // Parsing should succeed and not throw any exception.
+  CHECK_NOTHROW(mhdIO.ReadMetaData());
+
+  // The read fields should also be equal.
+  auto parsed_vmd = mhdIO.GetMetaData();
+  CHECK_EQ(parsed_vmd.dim,       vmd.dim);
+  CHECK_EQ(parsed_vmd.spacing,   vmd.spacing);
+  CHECK_EQ(parsed_vmd.voxelType, vmd.voxelType);
 }
 
 TEST_CASE("MHD volume reading fails") {

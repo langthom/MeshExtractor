@@ -18,4 +18,11 @@ size_t pme::VolumeMetaData::GetElementSizeInBytes(void) const {
   return pme::DISPATCH_VOXEL_TYPE(pme::ALL_VOXEL_TYPES, this->voxelType, sizeofCalculator);
 }
 
+std::uintmax_t pme::VolumeMetaData::GetNumberOfVoxels(void) const {
+  auto N = static_cast<std::uintmax_t>(this->dim[0]);
+  N     *= static_cast<std::uintmax_t>(this->dim[1]);
+  N     *= static_cast<std::uintmax_t>(this->dim[2]);
+  return N;
+}
+
 

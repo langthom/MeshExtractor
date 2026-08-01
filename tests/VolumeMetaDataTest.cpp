@@ -114,4 +114,20 @@ TEST_CASE("Compute the offsets for jumping to different columns, rows, or slices
   }
 }
 
+TEST_CASE("Compute the number of voxels for a volume") {
+  std::vector<std::array<std::uint32_t, 3>> dimensionsVec{
+    {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {2, 3, 4}
+  };
+
+  std::vector<std::uintmax_t> sizes{
+    0, 0, 0, 0, 24
+  };
+
+  for (int i = 0; i < dimensionsVec.size(); ++i) {
+    parallel_mesh_extractor::VolumeMetaData vmd;
+    vmd.dim = dimensionsVec[i];
+    CHECK(sizes[i] == vmd.GetNumberOfVoxels());
+  }
+}
+
 
