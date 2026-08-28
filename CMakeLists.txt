@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 4.4.0)
+
+# Specify CUDA architectures as required since CMake 3.18 (policy CMP0104).
+# Must happen before the call to "project".
+set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
+
 project(ParallelMeshExtractor
   VERSION 0.0.0
   LANGUAGES CXX CUDA

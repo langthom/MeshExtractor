@@ -4,6 +4,7 @@ add_executable(pme_tests
   TestsMain.cpp
   MHDIOTest.cpp
   VolumeMetaDataTest.cpp
+  ChunkifierTest.cpp
 )
 
 # Link the library this depends on.
