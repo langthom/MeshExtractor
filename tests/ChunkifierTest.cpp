@@ -1,119 +1,167 @@
 
+#include <array>
+#include <cstdint>
 #include <memory>
-#include <string>
-#include <vector>
 #include "doctest.h"
 #include "../MeshExtraction/Chunkifier.h"
 
 namespace pme = parallel_mesh_extractor;
 
-bool checkChunking(std::array<std::uint32_t, 3> const& dims) {
-  auto const chunkSize = pme::Chunkifier::ChunkSize;
+namespace {
 
-  // Create the input data, in which every tile already has its index as constant value.
-  auto const numVoxels = static_cast<std::int64_t>(dims[0]) * dims[1] * dims[2];
-  auto inputData = std::make_unique<float[]>(numVoxels);
+  // The chunk layout is a hard contract of the extraction pipeline: a 64^3 allocation owning a
+  // 62^3 core, wrapped in a 1 voxel ghost shell replicating the neighbors. The tests pin it with
+  // their own literals instead of deriving from the chunkifier's constants, so that changing those
+  // constants shows up as a test failure rather than silently moving the expectations along.
+  constexpr std::int32_t ChunkSize  = 64;
+  constexpr std::int32_t GhostWidth = 1;
+  constexpr std::int32_t CoreSize   = ChunkSize - 2 * GhostWidth;
 
-  std::array<std::int64_t, 3> numTiles;
-  for (int i = 0; i < 3; ++i) {
-    numTiles[i] = (dims[i] + chunkSize - 1) / chunkSize;
+  /// Create a volume in which every voxel carries a value that uniquely identifies its global
+  /// position, namely its flat index plus one. The offset keeps every real voxel distinguishable
+  /// from a 0.0f background value.
+  std::unique_ptr<float[]> makeVolume(std::array<std::uint32_t, 3> const& dims) {
+    auto const numVoxels = static_cast<std::int64_t>(dims[0]) * dims[1] * dims[2];
+
+    // A float only represents integers exactly up to 2^24, so the encoding above stays lossless
+    // only for volumes below that size. All test volumes are deliberately kept small.
+    REQUIRE(numVoxels < (1 << 24));
+
+    auto volume = std::make_unique<float[]>(numVoxels);
+    for (std::int64_t i = 0; i < numVoxels; ++i) {
+      volume[i] = static_cast<float>(i + 1);
+    }
+    return volume;
   }
 
-  #pragma omp parallel for
-  for (std::int64_t i = 0; i < numVoxels; ++i) {
-    // Conver the 1D index "i" into a 3D index.
-    std::int64_t const z = i / (dims[0] * dims[1]);
-    std::int64_t const k = i - z * dims[0] * dims[1];
-    std::int64_t const y = k / dims[0];
-    std::int64_t const x = k % dims[0];
+  /// Derive the value a chunk must carry at one of its local indices.
+  /// This deliberately re-derives the expectation from the chunk layout contract rather than from
+  /// the chunkifier: local index l of chunk c samples the global coordinate
+  /// (c * CoreSize + l - GhostWidth), and anything outside the volume is background.
+  float expectedAt(std::array<std::uint32_t, 3> const& chunkCoord,
+                   std::array<std::int32_t, 3> const& local,
+                   std::array<std::uint32_t, 3> const& dims,
+                   float background) {
+    std::array<std::int64_t, 3> global;
 
-    // Detect which tile this voxel belongs to.
-    std::int64_t const tileX  = x / chunkSize;
-    std::int64_t const tileY  = y / chunkSize;
-    std::int64_t const tileZ  = z / chunkSize;
-    std::int64_t const tileIx = (tileZ * numTiles[1] + tileY) * numTiles[0] + tileX;
+    for (int axis = 0; axis < 3; ++axis) {
+      global[axis] = static_cast<std::int64_t>(chunkCoord[axis]) * CoreSize
+                   + local[axis] - GhostWidth;
 
-    // Write the tile index for the voxel value.
-    inputData[i] = static_cast<float>(tileIx + 1);
+      if (global[axis] < 0 || global[axis] >= dims[axis]) {
+        return background;
+      }
+    }
+
+    auto const flatIndex = (global[2] * dims[1] + global[1]) * dims[0] + global[0];
+    return static_cast<float>(flatIndex + 1);
   }
 
-  // Create the expected chunk results.
-  // For the very first chunks in all axes (tileX = 0 or tileY = 0 or tileZ = 0), these will contain
-  // a 1-voxel padding boundary. Likewise, the last chunks in the respective axes are padded to 
-  // zeros as well. The intermediate chunks will respect the 1-voxel ghost layer overlay.
-  std::vector<pme::Chunkifier::DataChunk> expectedChunks(numTiles[0] * numTiles[1] * numTiles[2]);
+  void checkChunking(std::array<std::uint32_t, 3> const& dims, float background = 0.0f) {
+    auto const volume = makeVolume(dims);
 
-  auto tileCoordinateRange = [dims](std::int64_t tileIx, int axis) {
-    auto tx = static_cast<std::uint32_t>(tileIx);
-    // For the end, this is either the end of the chunk or the difference to the full volume.
-    std::uint32_t const coordinateEnd = std::min(pme::Chunkifier::ChunkSize, dims[axis] - tx * chunkSize) - 1;
-    return coordinateEnd;
-  };
+    std::array<std::uint32_t, 3> numChunks;
+    for (int axis = 0; axis < 3; ++axis) {
+      numChunks[axis] = (dims[axis] + CoreSize - 1) / CoreSize;
+    }
 
-  for (std::int64_t tileZ = 0; tileZ < numTiles[2]; ++tileZ) {
-    for (std::int64_t tileY = 0; tileY < numTiles[1]; ++tileY) {
-      for (std::int64_t tileX = 0; tileX < numTiles[0]; ++tileX) {
-        auto const tileIx1D = static_cast<float>((tileZ * numTiles[1] + tileY) * numTiles[0] + tileX);
+    pme::Chunkifier chunkifier(volume.get(), dims, background);
 
-        // Compute which portion of the current chunk receives the chunk index value.
-        auto const xEnd = tileCoordinateRange(tileX, 0);
-        auto const yEnd = tileCoordinateRange(tileY, 1);
-        auto const zEnd = tileCoordinateRange(tileZ, 2);
+    // We expect the traversal order Z->Y->X, i.e., X advancing fastest.
+    std::uint32_t chunkCount = 0;
 
-        // Write the expected value (the tileIx1D value) to every affected voxel in the chunk.
-        pme::Chunkifier::DataChunk& chunk = expectedChunks.at(tileIx1D);
-        for (int z = 0; z <= zEnd; ++z) {
-          for (int y = 0; y <= yEnd; ++y) {
-            for (int x = 0; x <= xEnd; ++x) {
-              chunk.data[z][y][x] = tileIx1D + 1;
+    for (auto const& chunk : chunkifier) {
+      std::array<std::uint32_t, 3> const chunkCoord = {
+        chunkCount % numChunks[0],
+        (chunkCount / numChunks[0]) % numChunks[1],
+        chunkCount / (numChunks[0] * numChunks[1]),
+      };
+
+      INFO("chunk ", chunkCount);
+
+      // The chunk has to report the global origin of the region it owns, which the extraction
+      // needs later on to place its vertices in world space.
+      std::array<std::uint32_t, 3> const expectedOrigin = {
+        chunkCoord[0] * CoreSize,
+        chunkCoord[1] * CoreSize,
+        chunkCoord[2] * CoreSize,
+      };
+      REQUIRE(chunk.CoreOrigin == expectedOrigin);
+
+      for (std::int32_t z = 0; z < ChunkSize; ++z) {
+        for (std::int32_t y = 0; y < ChunkSize; ++y) {
+          for (std::int32_t x = 0; x < ChunkSize; ++x) {
+            float const expected = expectedAt(chunkCoord, {x, y, z}, dims, background);
+
+            // Only report on an actual mismatch, so that a failure names the offending voxel
+            // instead of drowning in a quarter million successful assertions per chunk.
+            if (chunk.data[z][y][x] != expected) {
+              INFO("local voxel (", x, ", ", y, ", ", z, ")");
+              REQUIRE(chunk.data[z][y][x] == expected);
             }
           }
         }
       }
+
+      ++chunkCount;
     }
+
+    CHECK(chunkCount == numChunks[0] * numChunks[1] * numChunks[2]);
   }
 
-  // Now, run the chunkifier and compare the results. We expect the traversal order Z->Y->X.
-  pme::Chunkifier chunkifier(inputData.get(), dims);
-  auto chunkIterator         = chunkifier.begin();
-  auto chunkifierEnd         = chunkifier.end();
-  auto expectedChunkIterator = expectedChunks.begin();
+} // namespace
 
-  int ci = 0;
-
-  for (; chunkIterator != chunkifierEnd; ++chunkIterator, ++expectedChunkIterator, ++ci) {
-    auto const& currentChunk  = *chunkIterator;
-    auto const& expectedChunk = *expectedChunkIterator;
-
-    for (int z = 0; z < chunkSize; ++z) {
-      for (int y = 0; y < chunkSize; ++y) {
-        for (int x = 0; x < chunkSize; ++x) {
-          if (expectedChunk.data[z][y][x] != currentChunk.data[z][y][x]) {
-            return false;
-          }
-        }
-      }
-    }
-  }
-
-  return true;
+TEST_CASE("The chunk layout matches the extraction contract") {
+  // The extraction kernels rely on the allocation being a power of two, on a single ghost layer
+  // being available for the boundary cells, and on the core size being the chunk-to-chunk stride.
+  CHECK(pme::Chunkifier::ChunkSize  == ChunkSize);
+  CHECK(pme::Chunkifier::GhostWidth == GhostWidth);
+  CHECK(pme::Chunkifier::CoreSize   == CoreSize);
+  CHECK(pme::Chunkifier::DataChunk::ChunkDimSize == ChunkSize);
 }
 
-TEST_CASE("Chunkifying a too small data buffer") {
-  // In this test case, the original data buffer is smaller than a single chunk is.
-  // The expected result is the original data buffer, but padded with zeros.
-  CHECK(checkChunking({32, 32, 32}));
+TEST_CASE("Chunkifying a data buffer smaller than a single chunk core") {
+  // The whole volume fits into the core of one chunk, so the chunk is surrounded by background
+  // on all 6 sides -- both where the ghost shell reaches below the volume and where the core
+  // itself already runs past its end.
+  checkChunking({32, 32, 32});
 }
 
-TEST_CASE("Chunkifying a perfectly-sized data buffer") {
-  // Here, the chunk including the data and a 1 voxel padding on all sides in total
-  // takes the chunk size.
-  CHECK(checkChunking({pme::Chunkifier::ChunkSize, pme::Chunkifier::ChunkSize, pme::Chunkifier::ChunkSize}));
+TEST_CASE("Chunkifying a data buffer matching the chunk core exactly") {
+  // The core of a single chunk is filled completely, and the entire ghost shell around it falls
+  // outside the volume.
+  checkChunking({CoreSize, CoreSize, CoreSize});
 }
 
-TEST_CASE("Chunkifying larger data buffer") {
-  // Here there is actually something to do, i.e., there is more than a single chunk.
-  CHECK(checkChunking({32, 130, 64}));
+TEST_CASE("Chunkifying a data buffer exceeding the chunk core by a single voxel") {
+  // Guards the rounding of the chunk count: a single voxel past the core forces a second chunk
+  // per axis, whose own core holds just that one voxel.
+  constexpr std::uint32_t size = CoreSize + 1;
+  checkChunking({size, size, size});
 }
 
+TEST_CASE("Chunkifying a data buffer matching the chunk allocation size") {
+  // The allocation size is not the stride: 64 voxels per axis still spill into a second chunk,
+  // since a chunk only owns CoreSize of them.
+  constexpr std::uint32_t size = ChunkSize;
+  checkChunking({size, size, size});
+}
 
+TEST_CASE("Chunkifying a larger data buffer") {
+  // Here there is actually something to do, i.e., there is more than a single chunk, and the
+  // number of chunks differs per axis.
+  checkChunking({32, 130, 64});
+}
+
+TEST_CASE("Chunkifying a data buffer that is an exact multiple of the chunk core") {
+  // Without a remainder every ghost voxel between two chunks is backed by real data, so this
+  // covers the case in which the chunks in the middle are filled completely.
+  constexpr std::uint32_t size = 2 * CoreSize;
+  checkChunking({size, size, size});
+}
+
+TEST_CASE("Chunkifying pads outside of the volume with the background value") {
+  // Padding must honor the configured background, e.g. the air value of a CT scan, rather than
+  // defaulting to zero.
+  checkChunking({32, 32, 32}, -1000.0f);
+}
