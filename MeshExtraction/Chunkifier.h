@@ -20,6 +20,16 @@ namespace parallel_mesh_extractor {
   /// (at the very first and very last chunk of every axis), the chunk is filled with a
   /// configurable background value instead.
   class Chunkifier {
+
+    struct ChunkingDataCollection {
+      float const* Data;
+      std::array<std::uint32_t, 3> Dimensions;
+      std::vector<std::array<std::int64_t, 3>> CoreOrigins;
+      std::vector<std::array<float, 2>> ValueRanges;
+      float ISOThreshold;
+      float BackgroundValue;
+    };
+
   public:
 
     /// Total edge length of the allocated chunk. Deliberately kept a power of two so that the
@@ -38,35 +48,40 @@ namespace parallel_mesh_extractor {
 
     class ChunkIterator {
     public:
-      ChunkIterator(float const* data = nullptr, float backgroundValue = 0.0f) noexcept;
-
-      void ComputeChunkingOffsets(std::array<std::uint32_t, 3> const& dataDim);
+      ChunkIterator(ChunkingDataCollection const* chunkingDataCollectionPtr) noexcept;
 
       DataChunk operator*() const;
 
       ChunkIterator& operator++();
 
-      std::int32_t GetChunkIndex(void) const;
+      bool Equals(ChunkIterator const& other) const;
 
     private:
-      std::int32_t ChunkIndex = -1;
-      float const* Data = nullptr;
-      float BackgroundValue = 0.0f;
-      std::array<std::uint32_t, 3> DataDims;
-      std::vector<std::array<std::uint32_t, 3>> CoreOrigins;
+      /// Advance onto the next chunk whose value range contains the ISO threshold, so that the
+      /// iterator always rests on a chunk that is going to be materialized.
+      void SkipCulledChunks();
+
+      /// Whether this iterator has run out of chunks, which is also true for the sentinel that
+      /// end() hands out.
+      bool AtEnd() const;
+
+      ChunkingDataCollection const* ChunkingDataPtr;
+
+      std::vector<std::array<std::int64_t, 3>>::const_iterator CoreOriginsIterator, CoreOriginsEnd;
+      std::vector<std::array<float, 2>>::const_iterator ValueRangesIterator;
     };
 
     Chunkifier(float const* data, std::array<std::uint32_t, 3> const& dim,
-               float backgroundValue = 0.0f) noexcept;
+               float isoThreshold = 0.0f, float backgroundValue = 0.0f) noexcept;
+
+    void ComputeChunking(std::array<std::uint32_t, 3> const& dataDim);
 
     ChunkIterator begin() const;
 
     ChunkIterator end() const;
 
   private:
-    float const* Data;
-    std::array<std::uint32_t, 3> Dimensions;
-    float BackgroundValue;
+    ChunkingDataCollection ChunkingData;
   };
 
 } // namespace parallel_mesh_extractor

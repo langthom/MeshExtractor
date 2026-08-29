@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <omp.h>
 
 namespace pme = parallel_mesh_extractor;
@@ -10,35 +11,18 @@ namespace pme = parallel_mesh_extractor;
 // --------------------------------------- Chunkifier ------------------------------------------ //
 
 pme::Chunkifier::Chunkifier(float const* data, std::array<std::uint32_t, 3> const& dim,
-                            float backgroundValue) noexcept
-  : Data(data)
-  , Dimensions(dim)
-  , BackgroundValue(backgroundValue)
+                            float isoThreshold, float backgroundValue) noexcept
 {
+  ChunkingDataCollection cdc;
+  cdc.Data = data;
+  cdc.Dimensions = dim;
+  cdc.ISOThreshold = isoThreshold;
+  cdc.BackgroundValue = backgroundValue;
+
+  this->ChunkingData = cdc;
 }
 
-pme::Chunkifier::ChunkIterator pme::Chunkifier::begin() const {
-  ChunkIterator it(this->Data, this->BackgroundValue);
-  it.ComputeChunkingOffsets(this->Dimensions);
-  return it;
-}
-
-pme::Chunkifier::ChunkIterator pme::Chunkifier::end() const {
-  return ChunkIterator(nullptr, this->BackgroundValue);
-}
-
-// -------------------------------------- ChunkIterator ---------------------------------------- //
-
-pme::Chunkifier::ChunkIterator::ChunkIterator(float const* data, float backgroundValue) noexcept
-  : ChunkIndex(data == nullptr ? -1 : 0)
-  , Data(data)
-  , BackgroundValue(backgroundValue)
-{
-}
-
-void pme::Chunkifier::ChunkIterator::ComputeChunkingOffsets(std::array<std::uint32_t, 3> const& dim) {
-  this->DataDims = dim;
-
+void pme::Chunkifier::ComputeChunking(std::array<std::uint32_t, 3> const& dim) {
   // Compute the number of chunks.
   // Since the chunks only own their inner core and the ghost shell is pure overlap, consecutive
   // chunks advance by CoreSize rather than by the allocated ChunkSize.
@@ -49,32 +33,148 @@ void pme::Chunkifier::ChunkIterator::ComputeChunkingOffsets(std::array<std::uint
   // Construct the list of core origins, i.e., the global coordinate of the first voxel each chunk
   // owns. The ghost shell of a chunk then covers the coordinates [origin-GhostWidth, origin) and
   // [origin+CoreSize, origin+CoreSize+GhostWidth).
-  this->CoreOrigins.resize(static_cast<std::size_t>(numTilesX) * numTilesY * numTilesZ);
-  std::size_t tileIx1D = 0;
+  std::int64_t const numTiles = static_cast<std::int64_t>(numTilesX) * numTilesY * numTilesZ;
+  this->ChunkingData.CoreOrigins.resize(numTiles);
+  this->ChunkingData.ValueRanges.resize(numTiles);
 
-  for (std::uint32_t tileZ = 0; tileZ < numTilesZ; ++tileZ) {
-    for (std::uint32_t tileY = 0; tileY < numTilesY; ++tileY) {
-      for (std::uint32_t tileX = 0; tileX < numTilesX; ++tileX) {
-        this->CoreOrigins[tileIx1D++] = {
-          tileX * Chunkifier::CoreSize,
-          tileY * Chunkifier::CoreSize,
-          tileZ * Chunkifier::CoreSize,
-        };
+  // Compute how many threads to use.
+  // In case of a fixed defined OMP_NUM_THREADS, use that. Otherwise, use the available number of
+  // threads which might be reduced depending on the actual workload (number of Z axis slices).
+  int numThreads = 1;
+  #ifdef OMP_NUM_THREADS
+    numThreads = OMP_NUM_THREADS;
+  #else
+    numThreads = static_cast<int>(std::min<std::int64_t>(omp_get_max_threads(), numTiles));
+  #endif
+  numThreads = std::max(numThreads, 1);
+
+  #pragma omp parallel for schedule(static) num_threads(numThreads)
+  for (std::int64_t tileIx1D = 0; tileIx1D < numTiles; ++tileIx1D) {
+    // Compute the origin of the tile.
+    std::int64_t const tileZ = tileIx1D / (numTilesY * numTilesX);
+    std::int64_t const tyz   = tileIx1D - tileZ * numTilesY * numTilesX;
+    std::int64_t const tileY = tyz / numTilesX;
+    std::int64_t const tileX = tyz % numTilesX;
+
+    std::array<std::int64_t, 3> const origin = {
+      tileX * Chunkifier::CoreSize,
+      tileY * Chunkifier::CoreSize,
+      tileZ * Chunkifier::CoreSize,
+    };
+    this->ChunkingData.CoreOrigins[tileIx1D] = origin;
+
+    // ----------------------------------------
+    // Get the value range in the "core" region of this current tile.
+    // We compute the range at this point, so when the value range does
+    // not fit the ISO threshold later on, we never copy the data to 
+    // a chunk buffer.
+    float tileMin = +std::numeric_limits<float>::infinity();
+    float tileMax = -std::numeric_limits<float>::infinity();
+
+    // The cells a tile owns start at each of its CoreSize core voxels and span one voxel further,
+    // so the sampled box has to be CoreSize+1 voxels wide: the core itself plus the first voxel of
+    // the upper ghost layer. Sampling only CoreSize would miss a surface crossing in the outermost
+    // owned cell and cull a tile that does carry geometry, which would leave a hole in the mesh.
+    std::array<std::int64_t, 3> rangeBegin, rangeEnd;
+    bool reachesOutsideVolume = false;
+
+    for (int axis = 0; axis < 3; ++axis) {
+      std::int64_t const wantedEnd = origin[axis] + Chunkifier::CoreSize + 1;
+      rangeBegin[axis] = origin[axis];
+      rangeEnd[axis]   = std::min<std::int64_t>(wantedEnd, dim[axis]);
+      reachesOutsideVolume |= (wantedEnd > static_cast<std::int64_t>(dim[axis]));
+    }
+
+    // Where that box reaches past the volume, the chunk is padded with the background value. That
+    // padding is part of the data the extraction sees, and it is what closes the mesh along the
+    // volume wall, so it has to participate in the range as well.
+    if (reachesOutsideVolume) {
+      tileMin = std::min(tileMin, this->ChunkingData.BackgroundValue);
+      tileMax = std::max(tileMax, this->ChunkingData.BackgroundValue);
+    }
+
+    std::int64_t const rowLength = rangeEnd[0] - rangeBegin[0];
+
+    for (std::int64_t z = rangeBegin[2]; z < rangeEnd[2]; ++z) {
+      for (std::int64_t y = rangeBegin[1]; y < rangeEnd[1]; ++y) {
+        // Index arithmetic in std::size_t throughout: a volume of a few thousand voxels per axis
+        // already exceeds what a 32 bit index can address.
+        std::size_t rowIx1D = static_cast<std::size_t>(z) * dim[1];
+        rowIx1D += static_cast<std::size_t>(y);
+        rowIx1D *= dim[0];
+        rowIx1D += static_cast<std::size_t>(rangeBegin[0]);
+
+        float const* const row = this->ChunkingData.Data + rowIx1D;
+
+        // The reduction is requested explicitly because the compiler will not vectorize a float
+        // min/max reduction on its own: the NaN semantics of std::min do not match what vminps
+        // does, so without this pragma the loop stays scalar and costs several times as much.
+        #pragma omp simd reduction(min:tileMin) reduction(max:tileMax)
+        for (std::int64_t x = 0; x < rowLength; ++x) {
+          tileMin = std::min(tileMin, row[x]);
+          tileMax = std::max(tileMax, row[x]);
+        }
       }
     }
-  }
 
-  // An empty volume yields no chunks at all, in which case this iterator has to compare equal to
-  // the past-the-end iterator right away.
-  this->ChunkIndex = this->CoreOrigins.empty()
-                   ? -1
-                   : static_cast<std::int32_t>(this->CoreOrigins.size()) - 1;
+    this->ChunkingData.ValueRanges[tileIx1D] = {tileMin, tileMax};
+  }
+}
+
+pme::Chunkifier::ChunkIterator pme::Chunkifier::begin() const {
+  return ChunkIterator(&this->ChunkingData);
+}
+
+pme::Chunkifier::ChunkIterator pme::Chunkifier::end() const {
+  return ChunkIterator(nullptr);
+}
+
+// -------------------------------------- ChunkIterator ---------------------------------------- //
+
+pme::Chunkifier::ChunkIterator::ChunkIterator(ChunkingDataCollection const* chunkingDataCollectionPtr) noexcept
+  : ChunkingDataPtr(chunkingDataCollectionPtr)
+{
+  // A null collection constructs the past-the-end sentinel. It deliberately carries no position of
+  // its own -- there is no collection to take one from -- and Equals() below compares against it by
+  // asking whether the other side has any chunks left instead.
+  if (ChunkingDataPtr) {
+    this->CoreOriginsIterator = ChunkingDataPtr->CoreOrigins.cbegin();
+    this->CoreOriginsEnd      = ChunkingDataPtr->CoreOrigins.cend();
+    this->ValueRangesIterator = ChunkingDataPtr->ValueRanges.cbegin();
+
+    // Settle the culling immediately, so that even the very first chunk handed out is one that
+    // actually carries the surface.
+    this->SkipCulledChunks();
+  }
+}
+
+void pme::Chunkifier::ChunkIterator::SkipCulledChunks() {
+  // The culling has to be resolved here rather than on dereference: a range based for loop compares
+  // against end() *before* it dereferences, so by that point the iterator must already have skipped
+  // over every chunk whose value range does not contain the ISO threshold. Resolving it in
+  // operator*() instead would make the loop run one chunk past its last surviving one.
+  while (this->CoreOriginsIterator != this->CoreOriginsEnd) {
+    auto const [lo, hi] = *this->ValueRangesIterator;
+    if (lo <= this->ChunkingDataPtr->ISOThreshold && this->ChunkingDataPtr->ISOThreshold <= hi) {
+      return;
+    }
+
+    ++this->CoreOriginsIterator;
+    ++this->ValueRangesIterator;
+  }
+}
+
+bool pme::Chunkifier::ChunkIterator::AtEnd() const {
+  return this->ChunkingDataPtr == nullptr || this->CoreOriginsIterator == this->CoreOriginsEnd;
 }
 
 pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
+  // The constructor and operator++ have already skipped the culled chunks, so the iterator always
+  // rests on one that is meant to be materialized.
+  assert(!this->AtEnd());
+
   // Get the core origin of the current chunk.
-  assert(this->ChunkIndex >= 0);
-  auto const coreOrigin = this->CoreOrigins[this->CoreOrigins.size() - 1 - this->ChunkIndex];
+  auto const coreOrigin = *this->CoreOriginsIterator;
 
   // Construct the target chunk.
   DataChunk chunk;
@@ -90,7 +190,7 @@ pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
   for (int axis = 0; axis < 3; ++axis) {
     std::uint32_t const origin = coreOrigin[axis];
     localBegin[axis] = (origin < Chunkifier::GhostWidth) ? Chunkifier::GhostWidth - origin : 0;
-    localEnd[axis]   = std::min<std::uint32_t>(Chunkifier::ChunkSize, this->DataDims[axis] - origin + Chunkifier::GhostWidth);
+    localEnd[axis]   = std::min<std::uint32_t>(Chunkifier::ChunkSize, this->ChunkingDataPtr->Dimensions[axis] - origin + Chunkifier::GhostWidth);
     coversFullChunk &= (localBegin[axis] == 0 && localEnd[axis] == Chunkifier::ChunkSize);
   }
 
@@ -98,7 +198,7 @@ pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
   // background value instead. Chunks lying fully inside the volume are overwritten completely by
   // the copy below and can skip this.
   if (!coversFullChunk) {
-    chunk.Fill(this->BackgroundValue);
+    chunk.Fill(this->ChunkingDataPtr->BackgroundValue);
   }
 
   // Global coordinate the local index 0 of this chunk maps to. This is -GhostWidth for the first
@@ -141,12 +241,13 @@ pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
 
       // Index arithmetic in std::size_t throughout: a volume of a few thousand voxels per axis
       // already exceeds what a 32 bit index can address.
-      std::size_t dataIx1D = gz * this->DataDims[1];
+      std::size_t dataIx1D = gz * this->ChunkingDataPtr->Dimensions[1];
       dataIx1D += gy;
-      dataIx1D *= this->DataDims[0];
+      dataIx1D *= this->ChunkingDataPtr->Dimensions[0];
       dataIx1D += gx;
 
-      std::memcpy(&chunk.data[z][y][localBegin[0]], this->Data + dataIx1D, rowLength * sizeof(float));
+      auto localBeginPtr = &chunk.data[z][y][localBegin[0]];
+      std::memcpy(localBeginPtr, this->ChunkingDataPtr->Data + dataIx1D, rowLength * sizeof(float));
     }
   }
 
@@ -154,18 +255,22 @@ pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
 }
 
 pme::Chunkifier::ChunkIterator& pme::Chunkifier::ChunkIterator::operator++() {
-  // In our logic, we do only know the number of chunks from the ComputeChunkingOffsets function.
-  // Consequently, the past-the-end iterator constructed from null data does not know this.
-  // Therefore, we instead internally decrement the chunk index pointer upon incrementation, and
-  // we instead iterate until this chunk index (beginning from number of chunks minus one), reaches 0.
-  --this->ChunkIndex;
+  ++this->CoreOriginsIterator;
+  ++this->ValueRangesIterator;
+  this->SkipCulledChunks();
   return *this;
 }
 
-std::int32_t pme::Chunkifier::ChunkIterator::GetChunkIndex(void) const {
-  return this->ChunkIndex;
+bool pme::Chunkifier::ChunkIterator::Equals(ChunkIterator const& other) const {
+  // The past-the-end sentinel carries no position, so any comparison involving it reduces to the
+  // question of whether the other side still has chunks left. Comparing the underlying vector
+  // iterators is only meaningful while both sides actually point into the collection.
+  if (this->AtEnd() || other.AtEnd()) {
+    return this->AtEnd() == other.AtEnd();
+  }
+  return this->CoreOriginsIterator == other.CoreOriginsIterator;
 }
 
 bool operator!=(pme::Chunkifier::ChunkIterator const& lhs, pme::Chunkifier::ChunkIterator const& rhs) {
-  return lhs.GetChunkIndex() != rhs.GetChunkIndex();
+  return !lhs.Equals(rhs);
 }

@@ -21,7 +21,7 @@ namespace parallel_mesh_extractor {
     /// Global voxel coordinate of the first owned voxel, i.e., of the local index
     /// (GhostWidth, GhostWidth, GhostWidth). The ghost shell below it samples the global
     /// coordinate CoreOrigin-1, which is outside of the volume for the very first chunks.
-    std::array<std::uint32_t, 3> CoreOrigin{0, 0, 0};
+    std::array<std::int64_t, 3> CoreOrigin{0, 0, 0};
 
     float data[Size][Size][Size];
 
