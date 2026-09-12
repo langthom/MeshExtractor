@@ -163,11 +163,7 @@ namespace {
 
 } // namespace
 
-TEST_SUITE_BEGIN("gpu");
-
 TEST_CASE("An MHD volume becomes a closed PLY mesh of the right size") {
-  if (cudaMissing()) return;
-
   // The ball is comfortably inside the volume on every side, so nothing here depends on how the
   // volume boundary is handled, and the surface is a plain sphere.
   constexpr double radius = 40.0;
@@ -178,6 +174,7 @@ TEST_CASE("An MHD volume becomes a closed PLY mesh of the right size") {
   TemporaryOutput const output("pme_e2e_ball.ply");
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = SmoothBallIso;
   settings.BackgroundValue = 0.0f;
 
@@ -219,8 +216,6 @@ TEST_CASE("An MHD volume becomes a closed PLY mesh of the right size") {
 }
 
 TEST_CASE("The slab depth changes nothing but memory") {
-  if (cudaMissing()) return;
-
   // The point of the whole streaming arrangement. Reading one chunk layer at a time and reading
   // the entire volume at once have to produce the very same bytes; if welding or pruning were off
   // by anything at all, the files would differ.
@@ -230,6 +225,7 @@ TEST_CASE("The slab depth changes nothing but memory") {
                                ballField({49.5, 49.5, 99.5}, 40.0));
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = 1500.0f;
 
   std::vector<std::string> written;
@@ -260,8 +256,6 @@ TEST_CASE("The slab depth changes nothing but memory") {
 }
 
 TEST_CASE("The spacing and origin place the mesh in world coordinates") {
-  if (cudaMissing()) return;
-
   // "Offset" is the world position of the first voxel, in the same unit as the spacing, so a
   // vertex ends up at origin + voxel * spacing. Extracting the same volume both ways and comparing
   // states exactly that, without having to know where the surface actually runs.
@@ -276,6 +270,7 @@ TEST_CASE("The spacing and origin place the mesh in world coordinates") {
   TemporaryOutput const inWorld("pme_e2e_world.ply");
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = 1500.0f;
 
   settings.VoxelCoordinates = true;
@@ -316,8 +311,6 @@ TEST_CASE("The spacing and origin place the mesh in world coordinates") {
 }
 
 TEST_CASE("A raw file with a header of its own is read past correctly") {
-  if (cudaMissing()) return;
-
   // "HeaderSize" bytes of the raw file are not voxels. Extracting with and without such a header
   // in front of identical data has to give identical meshes.
   std::array<std::uint32_t, 3> const dim = {70, 70, 70};
@@ -331,6 +324,7 @@ TEST_CASE("A raw file with a header of its own is read past correctly") {
   TemporaryOutput const headedOut("pme_e2e_headed.ply");
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = 1500.0f;
 
   auto const plainReport  = pme::ExtractVolumeToPLY(plain.Path(),  plainOut.Path(),  settings);
@@ -342,8 +336,6 @@ TEST_CASE("A raw file with a header of its own is read past correctly") {
 }
 
 TEST_CASE("A volume with no surface produces a valid, empty mesh") {
-  if (cudaMissing()) return;
-
   // The chunkifier can cull every chunk away. That has to come out as an empty but well formed
   // PLY rather than as a failure or a truncated file.
   std::array<std::uint32_t, 3> const dim = {70, 70, 70};
@@ -353,6 +345,7 @@ TEST_CASE("A volume with no surface produces a valid, empty mesh") {
   TemporaryOutput const output("pme_e2e_empty.ply");
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = 1500.0f;
   settings.BackgroundValue = 500.0f;   // the same as the data, so the wall carries no surface either
 
@@ -367,8 +360,6 @@ TEST_CASE("A volume with no surface produces a valid, empty mesh") {
 }
 
 TEST_CASE("The ASCII form describes the same mesh as the binary one") {
-  if (cudaMissing()) return;
-
   std::array<std::uint32_t, 3> const dim = {70, 70, 70};
 
   TemporaryVolume const volume("pme_e2e_ascii", dim, {0.5f, 0.5f, 0.5f}, {1.5f, -2.5f, 0.25f},
@@ -378,6 +369,7 @@ TEST_CASE("The ASCII form describes the same mesh as the binary one") {
   TemporaryOutput const asciiOut("pme_e2e_ascii.ply");
 
   pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
   settings.IsoThreshold = 1500.0f;
 
   settings.Format = pme::PLYFormat::BinaryLittleEndian;
@@ -397,4 +389,83 @@ TEST_CASE("The ASCII form describes the same mesh as the binary one") {
   }
 }
 
+TEST_SUITE_BEGIN("gpu");
+
+TEST_CASE("Both extraction backends drive the pipeline to the same surface") {
+  // The cases above all pin the backend to the host, which is the default, so this is what keeps
+  // the device path exercised end to end.
+  //
+  // The two files are not expected to be byte identical: the device numbers its vertices in edge
+  // slot order and the host in the order the cells ask for them, so the same surface comes out
+  // with a different numbering. What has to match is the geometry and the counts.
+  if (cudaMissing()) return;
+
+  std::array<std::uint32_t, 3> const dim = {100, 100, 100};
+  TemporaryVolume const volume("pme_e2e_backends", dim, {0.5f, 0.5f, 1.0f}, {-3.0f, 1.5f, 0.25f},
+                               smoothBallField({49.5, 49.5, 49.5}, 32.0));
+
+  TemporaryOutput const onCpu("pme_e2e_backend_cpu.ply");
+  TemporaryOutput const onGpu("pme_e2e_backend_gpu.ply");
+
+  pme::ExtractionSettings settings;
+  settings.IsoThreshold = SmoothBallIso;
+
+  settings.Backend = pme::ExtractionBackend::Cpu;
+  auto const cpuReport = pme::ExtractVolumeToPLY(volume.Path(), onCpu.Path(), settings);
+
+  settings.Backend = pme::ExtractionBackend::Gpu;
+  auto const gpuReport = pme::ExtractVolumeToPLY(volume.Path(), onGpu.Path(), settings);
+
+  REQUIRE(cpuReport.Triangles > 0);
+  CHECK(std::string(cpuReport.BackendName) == "cpu");
+  CHECK(std::string(gpuReport.BackendName) == "gpu");
+  CHECK(gpuReport.Vertices == cpuReport.Vertices);
+  CHECK(gpuReport.Triangles == cpuReport.Triangles);
+
+  auto const fromCpu = readMesh(onCpu.Path());
+  auto const fromGpu = readMesh(onGpu.Path());
+
+  CHECK(ma::canonicalTriangles(fromCpu) == ma::canonicalTriangles(fromGpu));
+
+  // And each is a closed surface in its own right, so neither was welded into something the other
+  // merely happens to agree with.
+  for (auto const& mesh : {fromCpu, fromGpu}) {
+    auto const report = ma::analyzeManifold(mesh);
+    CHECK(report.BoundaryEdges == 0);
+    CHECK(report.IsWatertight);
+    CHECK(ma::eulerCharacteristic(mesh) == 2);
+  }
+}
+
 TEST_SUITE_END();
+
+TEST_CASE("The CPU backend gives the same result whatever the thread count") {
+  // Chunks are spread over the threads dynamically, so the order they finish in varies from run to
+  // run. The welding puts them back in order before anything is numbered, which is what makes the
+  // file independent of the scheduling -- byte for byte, not merely equivalent.
+  std::array<std::uint32_t, 3> const dim = {80, 80, 140};
+  TemporaryVolume const volume("pme_e2e_threads", dim, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f},
+                               smoothBallField({39.5, 39.5, 69.5}, 30.0));
+
+  pme::ExtractionSettings settings;
+  settings.Backend = pme::ExtractionBackend::Cpu;
+  settings.IsoThreshold = SmoothBallIso;
+
+  std::vector<std::string> written;
+  for (std::uint32_t threads : {1u, 2u, 5u, 16u}) {
+    TemporaryOutput const output("pme_e2e_threads_" + std::to_string(threads) + ".ply");
+    settings.ExtractionThreads = threads;
+
+    auto const report = pme::ExtractVolumeToPLY(volume.Path(), output.Path(), settings);
+    INFO(threads, " threads");
+    CHECK(report.Triangles > 0);
+    CHECK(report.ExtractionThreads == threads);
+
+    written.push_back(readAllBytes(output.Path()));
+  }
+
+  for (std::size_t i = 1; i < written.size(); ++i) {
+    INFO("thread count ", i, " against the single threaded run");
+    CHECK(written[i] == written[0]);
+  }
+}

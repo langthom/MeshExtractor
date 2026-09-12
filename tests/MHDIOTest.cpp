@@ -3,6 +3,7 @@
 #include <numeric>
 #include <fstream>
 #include <sstream>
+#include <vector>
 #include "doctest.h"
 #include "../VolumeIO/SliceChunkedMHDIO.h"
 
@@ -397,3 +398,81 @@ TEST_CASE("MHD volume reading succeeds") {
   }
 }
 
+
+TEST_CASE("Reading straight into a buffer converts the voxels, it does not reinterpret them") {
+  // The whole reason the reader has a conversion step is that the voxels are stored in their
+  // native type. Writing them into the caller's buffer must widen every element -- a uint16 of
+  // 1730 becomes the float 1730.0 -- and must emphatically not copy the bytes across and call the
+  // result a float. Checked against ReadSlices, which takes the long way round through its own
+  // buffer, and against values computed here.
+  auto check = [](parallel_mesh_extractor::VoxelType type) {
+    parallel_mesh_extractor::VolumeMetaData vmd;
+    vmd.dim       = {5, 4, 6};
+    vmd.spacing   = {1, 1, 1};
+    vmd.voxelType = type;
+
+    auto const size = vmd.GetNumberOfVoxels();
+    auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, size, 0, "Image", 3, "");
+    auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+    mhdIO.SetFilePath(mhd.GetMHDPath());
+    REQUIRE_NOTHROW(mhdIO.ReadMetaData());
+
+    auto const sliceSize = static_cast<std::size_t>(vmd.dim[0]) * vmd.dim[1];
+
+    for (auto const [begin, count] : std::vector<std::pair<unsigned, unsigned>>{{0, 6}, {0, 1}, {2, 3}, {5, 1}}) {
+      INFO("slices [", begin, ", ", begin + count, ")");
+
+      auto const viaBuffer = mhdIO.ReadSlices(begin, count);
+      REQUIRE(viaBuffer != nullptr);
+
+      std::vector<float> direct(sliceSize * count, -12345.0f);
+      REQUIRE(mhdIO.ReadSlicesInto(begin, count, direct.data()));
+
+      for (std::size_t i = 0; i < sliceSize * count; ++i) {
+        REQUIRE(direct[i] == viaBuffer[i]);
+      }
+
+      // And independently of the reader: the fixture fills the file with 0, 1, 2, ... in the
+      // native type, so the float at a given offset has to be that ordinal.
+      for (std::size_t i = 0; i < sliceSize * count; ++i) {
+        auto const expected = static_cast<float>(begin * sliceSize + i);
+        REQUIRE(direct[i] == expected);
+      }
+    }
+  };
+
+  using VT = parallel_mesh_extractor::VoxelType;
+  check(VT::UINT8);
+  check(VT::UINT16);
+  check(VT::UINT32);
+  check(VT::INT16);
+  check(VT::INT32);
+  check(VT::FLOAT32);
+  check(VT::FLOAT64);
+}
+
+TEST_CASE("Reading into a buffer honours the header size and rejects bad ranges") {
+  parallel_mesh_extractor::VolumeMetaData vmd;
+  vmd.dim       = {2, 3, 4};
+  vmd.spacing   = {1, 1, 1};
+  vmd.voxelType = parallel_mesh_extractor::VoxelType::UINT16;
+
+  auto const size = vmd.GetNumberOfVoxels();
+  auto const sliceSize = static_cast<std::size_t>(vmd.dim[0]) * vmd.dim[1];
+
+  auto mhd = ConstructTemporaryMHDFile(0xFF, "test", "test", vmd, size, 2048, "Image", 3, "");
+  auto mhdIO = parallel_mesh_extractor::SliceChunkedMHDIO();
+  mhdIO.SetFilePath(mhd.GetMHDPath());
+  REQUIRE_NOTHROW(mhdIO.ReadMetaData());
+
+  std::vector<float> buffer(size, -1.0f);
+  REQUIRE(mhdIO.ReadSlicesInto(0, vmd.dim[2], buffer.data()));
+  for (std::size_t i = 0; i < size; ++i) CHECK(buffer[i] == static_cast<float>(i));
+
+  // The same range rules ReadSlices applies, reported the same way.
+  CHECK_FALSE(mhdIO.ReadSlicesInto(4, 1, buffer.data()));
+  CHECK_FALSE(mhdIO.ReadSlicesInto(0, 0, buffer.data()));
+  CHECK_FALSE(mhdIO.ReadSlicesInto(3, 2, buffer.data()));
+  CHECK_FALSE(mhdIO.ReadSlicesInto(0, 1, nullptr));
+  (void)sliceSize;
+}

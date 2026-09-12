@@ -41,21 +41,20 @@ namespace {
 
 } // namespace
 
-pme::PLYStreamWriter::PLYStreamWriter(std::filesystem::path const& output, PLYFormat format)
+pme::PLYStreamWriter::PLYStreamWriter(std::filesystem::path const& output, PLYFormat format,
+                                      std::size_t faceBufferBytes)
   : OutputPath(output)
   , FaceTemporaryPath(output.string() + ".faces.tmp")
   , Format(format)
+  , FaceBufferLimit(faceBufferBytes)
 {
   this->Output.open(this->OutputPath, std::ios::binary | std::ios::out | std::ios::trunc);
   if (!this->Output) {
     throw std::runtime_error("cannot open the PLY output file: " + this->OutputPath.string());
   }
 
-  this->FaceTemporary.open(this->FaceTemporaryPath, std::ios::binary | std::ios::out | std::ios::trunc);
-  if (!this->FaceTemporary) {
-    throw std::runtime_error("cannot open the temporary face file: " + this->FaceTemporaryPath.string());
-  }
-
+  // No temporary file is opened up front. Most meshes never need one, and creating it
+  // unconditionally would leave a stray file behind for every run that did not.
   this->WriteHeader();
 }
 
@@ -65,8 +64,26 @@ pme::PLYStreamWriter::~PLYStreamWriter() {
   if (this->Finished) return;
 
   std::error_code ignored;
-  this->FaceTemporary.close();
+  if (this->FaceTemporary.is_open()) this->FaceTemporary.close();
   std::filesystem::remove(this->FaceTemporaryPath, ignored);
+}
+
+void pme::PLYStreamWriter::SpillFaceBuffer() {
+  if (this->FaceBuffer.empty()) return;
+
+  if (!this->FaceTemporary.is_open()) {
+    this->FaceTemporary.open(this->FaceTemporaryPath, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!this->FaceTemporary) {
+      throw std::runtime_error("cannot open the temporary face file: " + this->FaceTemporaryPath.string());
+    }
+    this->Spilled = true;
+  }
+
+  this->FaceTemporary.write(this->FaceBuffer.data(),
+                            static_cast<std::streamsize>(this->FaceBuffer.size()));
+  if (!this->FaceTemporary) throw std::runtime_error("writing to the temporary face file failed");
+
+  this->FaceBuffer.clear();
 }
 
 void pme::PLYStreamWriter::WriteHeader() {
@@ -165,8 +182,8 @@ void pme::PLYStreamWriter::WriteFaces(std::vector<std::uint32_t> const& indices)
     }
   }
 
-  this->FaceTemporary.write(this->Scratch.data(), static_cast<std::streamsize>(this->Scratch.size()));
-  if (!this->FaceTemporary) throw std::runtime_error("writing to the temporary face file failed");
+  this->FaceBuffer.insert(this->FaceBuffer.end(), this->Scratch.begin(), this->Scratch.end());
+  if (this->FaceBuffer.size() >= this->FaceBufferLimit) this->SpillFaceBuffer();
 
   this->Triangles += indices.size() / 3;
 }
@@ -176,7 +193,19 @@ void pme::PLYStreamWriter::WriteMesh(ChunkMesh const& mesh) {
   this->WriteFaces(mesh.Indices);
 }
 
-void pme::PLYStreamWriter::AppendFaceTemporary() {
+void pme::PLYStreamWriter::AppendFaces() {
+  // The common case: everything still fits in memory, so the faces go out in one sequential run
+  // straight after the vertices, and no temporary file was ever created.
+  if (!this->Spilled) {
+    this->FlushToOutput(this->FaceBuffer);
+    this->FaceBuffer.clear();
+    return;
+  }
+
+  // Otherwise push whatever is still buffered out first, so the temporary holds all of it in
+  // order, and then copy it across.
+  this->SpillFaceBuffer();
+
   this->FaceTemporary.flush();
   if (!this->FaceTemporary) throw std::runtime_error("flushing the temporary face file failed");
   this->FaceTemporary.close();
@@ -185,7 +214,7 @@ void pme::PLYStreamWriter::AppendFaceTemporary() {
   if (!faces) throw std::runtime_error("cannot reopen the temporary face file");
 
   // Block-wise rather than character-wise: the face data is the larger half of a big mesh.
-  std::vector<char> block(1 << 20);
+  std::vector<char> block(8 << 20);
   while (faces) {
     faces.read(block.data(), static_cast<std::streamsize>(block.size()));
     auto const got = faces.gcount();
@@ -215,7 +244,7 @@ void pme::PLYStreamWriter::PatchCounts() {
 void pme::PLYStreamWriter::Finish() {
   if (this->Finished) return;
 
-  this->AppendFaceTemporary();
+  this->AppendFaces();
   this->PatchCounts();
 
   this->Output.flush();

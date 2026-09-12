@@ -191,15 +191,22 @@ TEST_CASE("An empty mesh produces a valid, empty PLY") {
 // ---------------------------------- the temporary face file ---------------------------------- //
 
 TEST_CASE("The temporary face file lives next to the output and does not outlive the writer") {
-  // Next to the output rather than in the system temporary directory, so that appending it never
-  // crosses a filesystem and cannot run into a small /tmp.
+  // Next to the output rather than in the system temporary directory, so that a spill and its
+  // final append never cross a filesystem and cannot run into a small /tmp.
+  //
+  // A one byte face buffer forces the spill, which is the only way the file comes into existence
+  // at all now that faces are held in memory by default.
   TemporaryPath const output("pme_temporary.ply");
+  constexpr std::size_t forceSpill = 1;
 
-  SUBCASE("removed after finishing") {
+  SUBCASE("created on spilling, removed after finishing") {
     {
-      pme::PLYStreamWriter writer(output.Get(), pme::PLYFormat::BinaryLittleEndian);
-      CHECK(std::filesystem::exists(output.FaceTemporary()));
+      pme::PLYStreamWriter writer(output.Get(), pme::PLYFormat::BinaryLittleEndian, forceSpill);
+      CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
+
       writer.WriteMesh(awkwardMesh());
+      CHECK(std::filesystem::exists(output.FaceTemporary()));
+
       writer.Finish();
     }
     CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
@@ -207,8 +214,9 @@ TEST_CASE("The temporary face file lives next to the output and does not outlive
 
   SUBCASE("removed even when the writer is abandoned") {
     {
-      pme::PLYStreamWriter writer(output.Get(), pme::PLYFormat::BinaryLittleEndian);
+      pme::PLYStreamWriter writer(output.Get(), pme::PLYFormat::BinaryLittleEndian, forceSpill);
       writer.WriteMesh(awkwardMesh());
+      REQUIRE(std::filesystem::exists(output.FaceTemporary()));
       // No Finish: the output is left incomplete on purpose, but the scratch file is ours.
     }
     CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
@@ -256,4 +264,78 @@ TEST_CASE("Writing after finishing is refused") {
 
   // Finishing twice is harmless, so that a caller need not track whether it already did.
   CHECK_NOTHROW(writer.Finish());
+}
+
+// ----------------------------------- the in memory face buffer ------------------------------- //
+
+TEST_CASE("Buffering faces in memory and spilling them produce the same file") {
+  // Spilling exists only so that a mesh larger than memory still works. Which path was taken must
+  // not be visible in the result, so the two are compared byte for byte.
+  auto const mesh = awkwardMesh();
+
+  TemporaryPath const buffered("pme_buffered.ply");
+  TemporaryPath const spilled("pme_spilled.ply");
+
+  {
+    pme::PLYStreamWriter writer(buffered.Get(), pme::PLYFormat::BinaryLittleEndian,
+                                /*faceBufferBytes=*/1 << 20);
+    writer.WriteMesh(mesh);
+    writer.Finish();
+    CHECK_FALSE(writer.SpilledToDisk());
+  }
+  {
+    // One byte of buffer, so every batch of faces goes straight to the temporary file.
+    pme::PLYStreamWriter writer(spilled.Get(), pme::PLYFormat::BinaryLittleEndian,
+                                /*faceBufferBytes=*/1);
+    writer.WriteMesh(mesh);
+    writer.Finish();
+    CHECK(writer.SpilledToDisk());
+  }
+
+  std::ifstream a(buffered.Get(), std::ios::binary), b(spilled.Get(), std::ios::binary);
+  std::string const contentA{std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>()};
+  std::string const contentB{std::istreambuf_iterator<char>(b), std::istreambuf_iterator<char>()};
+  CHECK(contentA == contentB);
+}
+
+TEST_CASE("No temporary file is created when the faces fit in memory") {
+  // The common case, and the one worth protecting: a run that never spills should leave nothing
+  // behind and should never touch the disk twice for the same bytes.
+  TemporaryPath const output("pme_nospill.ply");
+
+  pme::PLYStreamWriter writer(output.Get(), pme::PLYFormat::BinaryLittleEndian);
+  CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
+
+  writer.WriteMesh(awkwardMesh());
+  CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
+
+  writer.Finish();
+  CHECK_FALSE(writer.SpilledToDisk());
+  CHECK_FALSE(std::filesystem::exists(output.FaceTemporary()));
+}
+
+TEST_CASE("Spilling across many small batches keeps the faces in order") {
+  // The spill path appends batch by batch, so an ordering slip would only show up once more than
+  // one spill has happened.
+  auto const mesh = awkwardMesh();
+
+  TemporaryPath const atOnce("pme_spill_once.ply");
+  TemporaryPath const batched("pme_spill_batched.ply");
+
+  {
+    pme::PLYStreamWriter writer(atOnce.Get(), pme::PLYFormat::BinaryLittleEndian);
+    writer.WriteMesh(mesh);
+    writer.Finish();
+  }
+  {
+    pme::PLYStreamWriter writer(batched.Get(), pme::PLYFormat::BinaryLittleEndian, 1);
+    writer.WriteVertices(mesh.Positions);
+    for (std::size_t i = 0; i < mesh.Indices.size(); i += 3) {
+      writer.WriteFaces({mesh.Indices[i], mesh.Indices[i + 1], mesh.Indices[i + 2]});
+    }
+    writer.Finish();
+    CHECK(writer.SpilledToDisk());
+  }
+
+  CHECK(pr::parsePLY(batched.Get()).Indices == pr::parsePLY(atOnce.Get()).Indices);
 }

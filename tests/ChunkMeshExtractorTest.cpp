@@ -12,6 +12,7 @@
 
 #include "doctest.h"
 #include "MeshAssertions.h"
+#include "../MeshExtraction/CpuChunkMeshExtractor.h"
 #include "../MeshExtraction/CudaChunkMeshExtractor.h"
 #include "../MeshExtraction/CudaUtils.h"
 
@@ -512,3 +513,101 @@ TEST_CASE("A failing CUDA call is reported as an exception") {
 }
 
 TEST_SUITE_END();
+
+// ------------------------------- the host backend agrees with it ----------------------------- //
+
+TEST_SUITE_BEGIN("gpu");
+
+TEST_CASE("The CPU extractor produces the same surface as the CUDA one") {
+  if (cudaMissing()) return;
+
+  // The two reach the result differently -- the device classifies everything and prefix sums the
+  // counts, the host assigns a vertex the first time an edge is asked for -- so the vertices come
+  // out in a different order and carry different indices. The *surface* must be identical, which
+  // is what comparing canonical triangles states without caring about the numbering.
+  auto check = [](std::unique_ptr<Chunk> const& chunk, float iso) {
+    pme::CudaChunkMeshExtractor gpu(iso);
+    pme::CpuChunkMeshExtractor cpu(iso);
+
+    pme::ChunkMesh fromGpu, fromCpu;
+    gpu.Extract(*chunk, fromGpu);
+    cpu.Extract(*chunk, fromCpu);
+
+    CHECK(fromCpu.Positions.size() == fromGpu.Positions.size());
+    CHECK(fromCpu.TriangleCount() == fromGpu.TriangleCount());
+    CHECK(ma::canonicalTriangles(fromCpu) == ma::canonicalTriangles(fromGpu));
+  };
+
+  SUBCASE("a ball") {
+    check(makeChunk({0, 0, 0}, ballField({31.5, 31.5, 31.5}, 20.0)), 0.0f);
+  }
+  SUBCASE("a ball, off the grid origin") {
+    check(makeChunk({CellDim, 2 * CellDim, 3 * CellDim}, ballField({80.0, 140.0, 200.0}, 18.0)), 0.0f);
+  }
+  SUBCASE("a plane") {
+    check(makeChunk({0, 0, 0}, [](std::int64_t, std::int64_t, std::int64_t z) {
+      return static_cast<float>(31.37 - static_cast<double>(z));
+    }), 0.0f);
+  }
+  SUBCASE("a chunk with no surface") {
+    check(makeChunk({0, 0, 0}, constantField(5.0f)), 0.0f);
+  }
+  SUBCASE("saturated with surface") {
+    check(makeChunk({0, 0, 0}, [](std::int64_t x, std::int64_t y, std::int64_t z) {
+      return ((x + y + z) % 2 == 0) ? +1.0f : -1.0f;
+    }), 0.0f);
+  }
+  SUBCASE("values sitting exactly on the isovalue") {
+    auto chunk = makeChunk({0, 0, 0}, constantField(-1.0f));
+    chunk->data[32][32][32] = 0.0f;
+    check(chunk, 0.0f);
+  }
+}
+
+TEST_SUITE_END();
+
+TEST_CASE("A CPU extractor reused across chunks keeps no state between them") {
+  // Its edge table is held across calls, so a stale entry would show up as a chunk inheriting a
+  // vertex from the one before it.
+  auto const ball  = makeChunk({0, 0, 0}, ballField({31.5, 31.5, 31.5}, 18.0));
+  auto const plane = makeChunk({0, 0, 0}, [](std::int64_t, std::int64_t, std::int64_t z) {
+    return static_cast<float>(20.5 - static_cast<double>(z));
+  });
+
+  pme::CpuChunkMeshExtractor extractor(0.0f);
+  pme::ChunkMesh first, second, other;
+
+  extractor.Extract(*ball, first);
+  extractor.Extract(*plane, other);
+  extractor.Extract(*ball, second);
+
+  REQUIRE_FALSE(first.IsEmpty());
+  CHECK(first.Positions == second.Positions);
+  CHECK(first.Indices == second.Indices);
+}
+
+TEST_CASE("The CPU extractor emits a properly indexed, closed surface") {
+  // The same statements the CUDA extractor is held to, checked independently of it so that this
+  // stands on its own when no GPU is present.
+  auto const chunk = makeChunk({0, 0, 0}, ballField({31.5, 31.5, 31.5}, 20.0));
+
+  pme::CpuChunkMeshExtractor extractor(0.0f);
+  pme::ChunkMesh mesh;
+  extractor.Extract(*chunk, mesh);
+
+  REQUIRE_FALSE(mesh.IsEmpty());
+  requireIndicesInRange(mesh);
+
+  auto const report = ma::analyzeManifold(mesh);
+  CHECK(report.BoundaryEdges == 0);
+  CHECK(report.NonManifoldEdges == 0);
+  CHECK(report.IsConsistentlyOriented);
+  CHECK(ma::eulerCharacteristic(mesh) == 2);
+
+  std::set<ma::PositionKey> distinct;
+  for (auto const& position : mesh.Positions) distinct.insert(ma::positionKey(position));
+  CHECK(distinct.size() == mesh.Positions.size());
+
+  constexpr double pi = 3.14159265358979323846;
+  CHECK(ma::surfaceArea(mesh) == doctest::Approx(4.0 * pi * 400.0).epsilon(0.02));
+}

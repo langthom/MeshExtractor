@@ -193,6 +193,44 @@ Buffer parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesImpl(unsigned int b
   return buffer;
 }
 
+bool parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesIntoImpl(unsigned int begin,
+                                                                   unsigned int numberOfSlices,
+                                                                   float* destination) {
+  // Same range rules as ReadSlicesImpl; reporting them the same way keeps the two interchangeable.
+  if (destination            ==               nullptr) { return false; }
+  if (begin                  >= this->metaData.dim[2]) { return false; }
+  if (begin + numberOfSlices >  this->metaData.dim[2]) { return false; }
+  if (numberOfSlices         >  this->metaData.dim[2]) { return false; }
+  if (numberOfSlices         ==                     0) { return false; }
+
+  auto const sliceSize      = static_cast<std::size_t>(this->metaData.dim[0]) * this->metaData.dim[1];
+  auto const elementSize    = this->metaData.GetElementSizeInBytes();
+  auto const sliceSizeBytes = sliceSize * elementSize;
+  auto const totalBytes     = static_cast<std::size_t>(numberOfSlices) * sliceSizeBytes;
+
+  std::ifstream mhdFile{this->volumeDataFilePath, std::ios::binary};
+  if (!mhdFile.seekg(this->headerSize + static_cast<std::int64_t>(begin) * sliceSizeBytes, std::ios::beg)) {
+    return false;
+  }
+
+  this->rawStaging.resize(totalBytes);
+  if (!mhdFile.read(this->rawStaging.data(), static_cast<std::streamsize>(totalBytes))) {
+    return false;
+  }
+
+  // The voxels are still in their native type here. Widening them is a per element conversion --
+  // the same one ReadSlicesImpl performs -- and emphatically not a reinterpretation of the bytes:
+  // a uint16 of 1730 has to become the float 1730.0, not whatever those two bytes happen to spell
+  // as half of a float. The only thing saved over ReadSlices is the buffer in between.
+  parallel_mesh_extractor::DISPATCH_VOXEL_TYPE(
+    parallel_mesh_extractor::ALL_VOXEL_TYPES,
+    this->metaData.voxelType,
+    impl::CastArrayToFloat,
+    destination, this->rawStaging.data(), static_cast<std::size_t>(numberOfSlices) * sliceSize
+  );
+  return true;
+}
+
 // ---------------------------------------------------------------------------------------------- //
 
 std::optional<impl::KeyValues> impl::parseMHDLine(std::string_view line) {

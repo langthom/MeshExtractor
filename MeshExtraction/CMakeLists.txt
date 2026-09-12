@@ -8,6 +8,8 @@ add_library(pme
   SlabSchedule.cpp
   MeshAssembler.h
   MeshAssembler.cpp
+  CpuChunkMeshExtractor.h
+  CpuChunkMeshExtractor.cpp
   # GPU surface extraction.
   ChunkMesh.h
   CudaUtils.h
