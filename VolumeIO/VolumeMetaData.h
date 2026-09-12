@@ -143,6 +143,12 @@ namespace parallel_mesh_extractor {
     /// Voxel size in [mm] along its X, Y, Z axes.
     std::array<float, 3> spacing;
 
+    /// World coordinate of the very first voxel, in the same unit as the spacing. Everything
+    /// extracted from the volume is translated by it, so that a mesh lands where the scan says it
+    /// belongs rather than at the corner of the voxel grid. Defaulted, because a volume that names
+    /// no origin simply sits at zero.
+    std::array<float, 3> origin{0.0f, 0.0f, 0.0f};
+
     /// Enumeration value defining which voxel type the natively stored data takes.
     VoxelType voxelType;
 

@@ -1,0 +1,7 @@
+# CMake build trees.
+build/
+build*/
+
+# Editor and tooling leftovers.
+.cache/
+compile_commands.json

@@ -205,6 +205,81 @@ namespace {
     return count;
   }
 
+  // ------------------------------------ slab wise chunking ------------------------------------ //
+
+  /// A chunk as the extraction would see it, kept whole so that a slab run can be compared against
+  /// a whole volume run voxel for voxel rather than only by its origin.
+  struct MaterializedChunk {
+    std::array<std::int64_t, 3> Origin;
+    std::vector<float> Data;
+
+    bool operator==(MaterializedChunk const& other) const {
+      return this->Origin == other.Origin && this->Data == other.Data;
+    }
+  };
+
+  MaterializedChunk materialize(pme::Chunkifier::DataChunk const& chunk) {
+    MaterializedChunk result;
+    result.Origin = chunk.CoreOrigin;
+    result.Data.assign(&chunk.data[0][0][0],
+                       &chunk.data[0][0][0] + ChunkSize * ChunkSize * ChunkSize);
+    return result;
+  }
+
+  /// The slices a single chunk layer needs: its chunks reach one voxel below their core origin and
+  /// one past their core, clamped to the volume because anything outside it is background.
+  std::pair<std::int64_t, std::int64_t> slabRangeForLayer(std::int64_t tileZ, Dims const& dims) {
+    std::int64_t const origin = tileZ * CoreSize;
+    return {std::max<std::int64_t>(origin - GhostWidth, 0),
+            std::min<std::int64_t>(origin - GhostWidth + ChunkSize, dims[2])};
+  }
+
+  /// Copy the slices [zBegin, zEnd) into a standalone buffer, which is what a streaming reader
+  /// hands over: the slab knows nothing of the slices around it.
+  Volume makeSlab(Volume const& volume, Dims const& dims, std::int64_t zBegin, std::int64_t zEnd) {
+    auto const sliceSize = static_cast<std::int64_t>(dims[0]) * dims[1];
+    Volume slab = std::make_unique<float[]>((zEnd - zBegin) * sliceSize);
+    std::copy_n(volume.get() + zBegin * sliceSize, (zEnd - zBegin) * sliceSize, slab.get());
+    return slab;
+  }
+
+  std::vector<MaterializedChunk> collectWholeVolume(Volume const& volume, Dims const& dims,
+                                                    float isoThreshold, float background) {
+    pme::Chunkifier chunkifier(volume.get(), dims, isoThreshold, background);
+    chunkifier.ComputeChunking(dims);
+
+    std::vector<MaterializedChunk> chunks;
+    for (auto const& chunk : chunkifier) chunks.push_back(materialize(chunk));
+    return chunks;
+  }
+
+  /// The slab window describing "hold just enough for layer tileZ, and produce only that layer".
+  pme::SlabWindow windowForLayer(std::int64_t tileZ, Dims const& dims) {
+    auto const [zBegin, zEnd] = slabRangeForLayer(tileZ, dims);
+
+    pme::SlabWindow window;
+    window.ZBegin     = zBegin;
+    window.ZCount     = static_cast<std::uint32_t>(zEnd - zBegin);
+    window.TileZBegin = tileZ;
+    window.TileZCount = 1;
+    window.PruneBelowZ = static_cast<float>((tileZ + 1) * CoreSize);
+    return window;
+  }
+
+  std::vector<MaterializedChunk> collectOneLayer(Volume const& volume, Dims const& dims,
+                                                 std::int64_t tileZ,
+                                                 float isoThreshold, float background) {
+    auto const window = windowForLayer(tileZ, dims);
+    auto const slab = makeSlab(volume, dims, window.ZBegin, window.ZBegin + window.ZCount);
+
+    pme::Chunkifier chunkifier(slab.get(), dims, window, isoThreshold, background);
+    chunkifier.ComputeChunking(dims);
+
+    std::vector<MaterializedChunk> chunks;
+    for (auto const& chunk : chunkifier) chunks.push_back(materialize(chunk));
+    return chunks;
+  }
+
 } // namespace
 
 // ------------------------------------- the chunk layout -------------------------------------- //
@@ -392,4 +467,142 @@ TEST_CASE("Iteration terminates when the trailing chunks are all culled") {
 
   // Only the lowest of the three chunk layers along Z spans the isovalue.
   CHECK(countChunks(volume, dims, 10.0f, 200.0f) == 9);
+}
+
+// ------------------------------------ slab wise chunking ------------------------------------- //
+
+TEST_CASE("A slab covering a single layer hands out exactly that layer") {
+  // The point of slabbing: a chunk layer can be produced from the 64 slices it touches, without
+  // the rest of the volume ever being in memory. The coverage rule has to select precisely one
+  // layer for such a slab -- one more would duplicate geometry, one fewer would lose it.
+  Dims const dims = {70, 70, 200};
+  auto const volume = makeVolume(dims);
+  auto const numTiles = numTilesOf(dims);
+  REQUIRE(numTiles[2] == 4);
+
+  for (std::int64_t tileZ = 0; tileZ < numTiles[2]; ++tileZ) {
+    INFO("layer ", tileZ);
+    auto const chunks = collectOneLayer(volume, dims, tileZ, 0.0f, 0.0f);
+
+    REQUIRE_FALSE(chunks.empty());
+    for (auto const& chunk : chunks) {
+      CHECK(chunk.Origin[2] == tileZ * CoreSize);
+    }
+  }
+}
+
+TEST_CASE("Chunking slab by slab reproduces the whole volume chunking exactly") {
+  // Every chunk, in the same order, with the same core origin and the same 64^3 voxels. This is
+  // what lets the streaming pipeline claim that slabbing changes nothing but peak memory.
+  auto check = [](Dims const& dims, float isoThreshold, float background) {
+    auto const volume = makeVolume(dims);
+    auto const whole = collectWholeVolume(volume, dims, isoThreshold, background);
+
+    std::vector<MaterializedChunk> streamed;
+    for (std::int64_t tileZ = 0; tileZ < numTilesOf(dims)[2]; ++tileZ) {
+      auto const layer = collectOneLayer(volume, dims, tileZ, isoThreshold, background);
+      streamed.insert(streamed.end(), layer.begin(), layer.end());
+    }
+
+    INFO("whole volume produced ", whole.size(), " chunks, slabbing produced ", streamed.size());
+    REQUIRE(streamed.size() == whole.size());
+    for (std::size_t i = 0; i < whole.size(); ++i) {
+      INFO("chunk ", i);
+      CHECK(streamed[i] == whole[i]);
+    }
+  };
+
+  SUBCASE("several layers, with a remainder along z") {
+    check({70, 70, 200}, 0.0f, 0.0f);
+  }
+
+  SUBCASE("z an exact multiple of the core size") {
+    check({40, 40, 3 * CoreSize}, 0.0f, 0.0f);
+  }
+
+  SUBCASE("a volume shallower than a single chunk core") {
+    check({40, 40, 20}, 0.0f, 0.0f);
+  }
+
+  SUBCASE("a non zero background, which the outermost layers pad with") {
+    // The first and last layers reach outside the volume, so their chunks are part data and part
+    // background. A slab that simply started at its first real slice without saying so would fill
+    // that padding from the wrong place.
+    check({40, 40, 130}, -5000.0f, -1000.0f);
+  }
+}
+
+TEST_CASE("A slab claiming no layers hands out nothing") {
+  // A slab is responsible for the layers it names. Naming none, or naming layers the volume does
+  // not have, must produce nothing rather than whatever the slices in hand happen to allow.
+  Dims const dims = {40, 40, 200};
+  auto const volume = makeVolume(dims);
+
+  auto emptyFor = [&](std::int64_t zBegin, std::int64_t zEnd,
+                      std::int64_t tileZBegin, std::int64_t tileZCount) {
+    auto const slab = makeSlab(volume, dims, zBegin, zEnd);
+
+    pme::SlabWindow window;
+    window.ZBegin = zBegin;
+    window.ZCount = static_cast<std::uint32_t>(zEnd - zBegin);
+    window.TileZBegin = tileZBegin;
+    window.TileZCount = tileZCount;
+
+    pme::Chunkifier chunkifier(slab.get(), dims, window, 0.0f, 0.0f);
+    chunkifier.ComputeChunking(dims);
+
+    std::size_t count = 0;
+    for (auto const& chunk : chunkifier) { (void)chunk; ++count; }
+    INFO("slab [", zBegin, ", ", zEnd, ") claiming ", tileZCount, " layers from ", tileZBegin);
+    CHECK(count == 0);
+  };
+
+  emptyFor(10, 20, 0, 0);          // claims nothing
+  emptyFor(0, 63, 0, 0);           // holds layer 0, but claims nothing
+  emptyFor(0, 200, 99, 4);         // claims layers past the end of the grid
+  emptyFor(0, 200, 4, 0);          // a zero length claim
+}
+
+TEST_CASE("The coverage rule states capability, and a slab never reaches backwards") {
+  // A slab sized for one layer can serve that layer, and can never serve a lower one, since a
+  // lower layer needs slices it does not hold.
+  //
+  // It can, however, turn out to be capable of a *higher* layer: the last layer of a volume may
+  // need only a handful of slices, few enough to fall inside the slab below it. That is exactly
+  // why which layers a slab produces is passed in rather than inferred -- inferring it from
+  // capability alone would emit such a layer from two different slabs.
+  Dims const dims = {8, 8, 200};
+  auto const numTiles = numTilesOf(dims);
+
+  for (std::int64_t owner = 0; owner < numTiles[2]; ++owner) {
+    auto const [zBegin, zEnd] = slabRangeForLayer(owner, dims);
+
+    INFO("slab of layer ", owner, " spans [", zBegin, ", ", zEnd, ")");
+    CHECK(pme::Chunkifier::CoversLayer(owner, dims, zBegin, zEnd));
+
+    for (std::int64_t lower = 0; lower < owner; ++lower) {
+      INFO("asked about the lower layer ", lower);
+      CHECK_FALSE(pme::Chunkifier::CoversLayer(lower, dims, zBegin, zEnd));
+    }
+  }
+}
+
+TEST_CASE("A slab capable of a layer it does not own still leaves that layer alone") {
+  // The concrete case the ownership rule exists for. At this depth the final layer needs only two
+  // real slices, both of which the slab below it already holds -- so capability alone would hand
+  // the same layer out twice.
+  Dims const dims = {8, 8, 125};
+  auto const numTiles = numTilesOf(dims);
+  REQUIRE(numTiles[2] == 3);
+
+  auto const belowIt = windowForLayer(1, dims);
+  REQUIRE(pme::Chunkifier::CoversLayer(2, dims, belowIt.ZBegin, belowIt.ZBegin + belowIt.ZCount));
+
+  auto const volume = makeVolume(dims);
+  auto const chunks = collectOneLayer(volume, dims, 1, 0.0f, 0.0f);
+
+  REQUIRE_FALSE(chunks.empty());
+  for (auto const& chunk : chunks) {
+    CHECK(chunk.Origin[2] == 1 * CoreSize);
+  }
 }

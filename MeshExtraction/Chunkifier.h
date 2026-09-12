@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include "Chunk.h"
+#include "SlabSchedule.h"
 
 namespace parallel_mesh_extractor {
 
@@ -23,7 +24,16 @@ namespace parallel_mesh_extractor {
 
     struct ChunkingDataCollection {
       float const* Data;
+
+      /// Dimensions of the *whole* volume, not of the slab held in "Data". The chunk grid is laid
+      /// out over the volume, so that a chunk's core origin means the same thing no matter which
+      /// slab produced it.
       std::array<std::uint32_t, 3> Dimensions;
+
+      /// The slab in hand and the chunk layers it is responsible for. Every read of "Data"
+      /// subtracts Slab.ZBegin from the global z to reach the slice actually held.
+      SlabWindow Slab;
+
       std::vector<std::array<std::int64_t, 3>> CoreOrigins;
       std::vector<std::array<float, 2>> ValueRanges;
       float ISOThreshold;
@@ -71,10 +81,32 @@ namespace parallel_mesh_extractor {
       std::vector<std::array<float, 2>>::const_iterator ValueRangesIterator;
     };
 
+    /// Chunks a volume held in memory in its entirety.
     Chunkifier(float const* data, std::array<std::uint32_t, 3> const& dim,
                float isoThreshold = 0.0f, float backgroundValue = 0.0f) noexcept;
 
+    /// Chunks one slab of a volume that is too large to hold at once.
+    ///
+    /// "slabData" holds the slices [slab.ZBegin, slab.ZBegin + slab.ZCount) of a volume whose
+    /// overall dimensions are "dim", laid out exactly as the corresponding part of the full volume
+    /// would be. Exactly the chunk layers named by "slab" are handed out.
+    ///
+    /// Which layers a slab is *responsible* for is the caller's decision rather than something
+    /// inferred from the slices in hand, and deliberately so: a short final layer needs so few
+    /// slices that more than one slab can be capable of producing it, and a chunkifier guessing
+    /// from capability alone would emit it twice. PlanSlabs assigns every layer to one slab, and
+    /// CoversLayer below states what a slab has to hold to honour that assignment.
+    Chunkifier(float const* slabData, std::array<std::uint32_t, 3> const& dim,
+               SlabWindow const& slab,
+               float isoThreshold = 0.0f, float backgroundValue = 0.0f) noexcept;
+
     void ComputeChunking(std::array<std::uint32_t, 3> const& dataDim);
+
+    /// Whether a slab holds every slice the given chunk layer needs. This is a statement about
+    /// capability, not about ownership: several slabs may be able to produce the same layer, which
+    /// is why the layer assignment is passed in rather than derived from this.
+    static bool CoversLayer(std::int64_t tileZ, std::array<std::uint32_t, 3> const& dim,
+                            std::int64_t slabZBegin, std::int64_t slabZEnd);
 
     ChunkIterator begin() const;
 

@@ -10,16 +10,59 @@ namespace pme = parallel_mesh_extractor;
 
 // --------------------------------------- Chunkifier ------------------------------------------ //
 
+namespace {
+  /// The slab describing a volume held in its entirety: every slice, and every chunk layer.
+  pme::SlabWindow wholeVolumeSlab(std::array<std::uint32_t, 3> const& dim) {
+    pme::SlabWindow slab;
+    slab.ZBegin = 0;
+    slab.ZCount = dim[2];
+    slab.TileZBegin = 0;
+    slab.TileZCount = (static_cast<std::int64_t>(dim[2]) + pme::Chunkifier::CoreSize - 1)
+                    / pme::Chunkifier::CoreSize;
+    slab.PruneBelowZ = static_cast<float>(slab.TileZCount * pme::Chunkifier::CoreSize);
+    return slab;
+  }
+} // namespace
+
 pme::Chunkifier::Chunkifier(float const* data, std::array<std::uint32_t, 3> const& dim,
+                            float isoThreshold, float backgroundValue) noexcept
+  : Chunkifier(data, dim, wholeVolumeSlab(dim), isoThreshold, backgroundValue)
+{
+  // Holding the whole volume is just the slab that happens to span all of it.
+}
+
+pme::Chunkifier::Chunkifier(float const* slabData, std::array<std::uint32_t, 3> const& dim,
+                            SlabWindow const& slab,
                             float isoThreshold, float backgroundValue) noexcept
 {
   ChunkingDataCollection cdc;
-  cdc.Data = data;
+  cdc.Data = slabData;
   cdc.Dimensions = dim;
+  cdc.Slab = slab;
   cdc.ISOThreshold = isoThreshold;
   cdc.BackgroundValue = backgroundValue;
 
   this->ChunkingData = cdc;
+}
+
+bool pme::Chunkifier::CoversLayer(std::int64_t tileZ, std::array<std::uint32_t, 3> const& dim,
+                                  std::int64_t slabZBegin, std::int64_t slabZEnd) {
+  // A chunk of layer tileZ spans the global z range [origin - GhostWidth, origin - GhostWidth +
+  // ChunkSize). Only the part of that range lying inside the volume has to be present in the slab:
+  // everything else is background, which the chunk fills in for itself.
+  std::int64_t const origin = tileZ * static_cast<std::int64_t>(Chunkifier::CoreSize);
+  std::int64_t const spanBegin = origin - static_cast<std::int64_t>(Chunkifier::GhostWidth);
+  std::int64_t const spanEnd   = spanBegin + static_cast<std::int64_t>(Chunkifier::ChunkSize);
+
+  std::int64_t const neededBegin = std::max<std::int64_t>(spanBegin, 0);
+  std::int64_t const neededEnd   = std::min<std::int64_t>(spanEnd, dim[2]);
+
+  // A layer lying wholly outside the volume needs no real data at all. This cannot happen for a
+  // layer the chunk grid actually contains, but stating it keeps the rule complete rather than
+  // relying on that.
+  if (neededBegin >= neededEnd) return true;
+
+  return neededBegin >= slabZBegin && neededEnd <= slabZEnd;
 }
 
 void pme::Chunkifier::ComputeChunking(std::array<std::uint32_t, 3> const& dim) {
@@ -30,12 +73,27 @@ void pme::Chunkifier::ComputeChunking(std::array<std::uint32_t, 3> const& dim) {
   std::uint32_t const numTilesY = (dim[1] + Chunkifier::CoreSize - 1) / Chunkifier::CoreSize;
   std::uint32_t const numTilesX = (dim[0] + Chunkifier::CoreSize - 1) / Chunkifier::CoreSize;
 
+  // The chunk layers this slab is responsible for. Clamped against the grid so that a caller
+  // naming layers the volume does not have gets nothing rather than reads past the data.
+  std::int64_t const firstTileZ = std::clamp<std::int64_t>(this->ChunkingData.Slab.TileZBegin, 0, numTilesZ);
+  std::int64_t const tileZCount =
+    std::clamp<std::int64_t>(this->ChunkingData.Slab.TileZCount, 0, numTilesZ - firstTileZ);
+
+  // Every layer claimed has to be one the slab can actually serve. Getting this wrong produces
+  // silently truncated chunks rather than an obvious failure, so it is checked rather than assumed.
+  for (std::int64_t tileZ = firstTileZ; tileZ < firstTileZ + tileZCount; ++tileZ) {
+    assert(Chunkifier::CoversLayer(tileZ, dim, this->ChunkingData.Slab.ZBegin,
+                                   this->ChunkingData.Slab.ZBegin + this->ChunkingData.Slab.ZCount));
+  }
+
   // Construct the list of core origins, i.e., the global coordinate of the first voxel each chunk
   // owns. The ghost shell of a chunk then covers the coordinates [origin-GhostWidth, origin) and
   // [origin+CoreSize, origin+CoreSize+GhostWidth).
-  std::int64_t const numTiles = static_cast<std::int64_t>(numTilesX) * numTilesY * numTilesZ;
+  std::int64_t const numTiles = static_cast<std::int64_t>(numTilesX) * numTilesY * tileZCount;
   this->ChunkingData.CoreOrigins.resize(numTiles);
   this->ChunkingData.ValueRanges.resize(numTiles);
+
+  if (numTiles == 0) return;
 
   // Compute how many threads to use.
   // In case of a fixed defined OMP_NUM_THREADS, use that. Otherwise, use the available number of
@@ -50,11 +108,13 @@ void pme::Chunkifier::ComputeChunking(std::array<std::uint32_t, 3> const& dim) {
 
   #pragma omp parallel for schedule(static) num_threads(numThreads)
   for (std::int64_t tileIx1D = 0; tileIx1D < numTiles; ++tileIx1D) {
-    // Compute the origin of the tile.
-    std::int64_t const tileZ = tileIx1D / (numTilesY * numTilesX);
-    std::int64_t const tyz   = tileIx1D - tileZ * numTilesY * numTilesX;
-    std::int64_t const tileY = tyz / numTilesX;
-    std::int64_t const tileX = tyz % numTilesX;
+    // Compute the origin of the tile. The z index is relative to the first layer this slab covers,
+    // so it has to be lifted back onto the volume's own chunk grid.
+    std::int64_t const localTileZ = tileIx1D / (numTilesY * numTilesX);
+    std::int64_t const tyz        = tileIx1D - localTileZ * numTilesY * numTilesX;
+    std::int64_t const tileY      = tyz / numTilesX;
+    std::int64_t const tileX      = tyz % numTilesX;
+    std::int64_t const tileZ      = firstTileZ + localTileZ;
 
     std::array<std::int64_t, 3> const origin = {
       tileX * Chunkifier::CoreSize,
@@ -98,8 +158,9 @@ void pme::Chunkifier::ComputeChunking(std::array<std::uint32_t, 3> const& dim) {
     for (std::int64_t z = rangeBegin[2]; z < rangeEnd[2]; ++z) {
       for (std::int64_t y = rangeBegin[1]; y < rangeEnd[1]; ++y) {
         // Index arithmetic in std::size_t throughout: a volume of a few thousand voxels per axis
-        // already exceeds what a 32 bit index can address.
-        std::size_t rowIx1D = static_cast<std::size_t>(z) * dim[1];
+        // already exceeds what a 32 bit index can address. The z coordinate is global, while the
+        // buffer only holds the slab, hence the shift onto the slice actually in hand.
+        std::size_t rowIx1D = static_cast<std::size_t>(z - this->ChunkingData.Slab.ZBegin) * dim[1];
         rowIx1D += static_cast<std::size_t>(y);
         rowIx1D *= dim[0];
         rowIx1D += static_cast<std::size_t>(rangeBegin[0]);
@@ -233,7 +294,8 @@ pme::Chunkifier::DataChunk pme::Chunkifier::ChunkIterator::operator*() const {
   // likely destroy cache coherence and introduce too much thread creation overhead.
   #pragma omp parallel for schedule(static) num_threads(numThreads)
   for (std::int32_t z = zBegin; z < zEnd; ++z) {
-    auto const gz = static_cast<std::size_t>(globalBase[2] + z);
+    // The buffer holds only the slab, so the global z has to be shifted onto the slice in hand.
+    auto const gz = static_cast<std::size_t>(globalBase[2] + z - this->ChunkingDataPtr->Slab.ZBegin);
 
     for (std::int32_t y = yBegin; y < yEnd; ++y) {
       auto const gy = static_cast<std::size_t>(globalBase[1] + y);

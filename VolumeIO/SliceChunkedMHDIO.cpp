@@ -28,7 +28,10 @@ namespace impl {
 
   template<char Mask, class T, size_t Size, bool EnforceGTZero=true>
   void checkValues(std::vector<std::string_view> const& svs, std::array<T, Size>& values, char& maskValue) {
-    if (values.size() < Size) {
+    // Guard the *parsed* list, not the destination: the destination is a fixed size array, so
+    // asking it for its size can never fail and would let a line carrying too few values read past
+    // the end of "svs" below.
+    if (svs.size() < Size) {
       throw std::runtime_error("Number of expected values not fulfilled.");
     }
     for (int i = 0; i < Size; ++i) {
@@ -69,6 +72,16 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
                                             fileError);
   }
 
+  // Reset the optional fields, so that re-reading with this object cannot inherit a header size or
+  // an origin from the file it parsed before.
+  this->headerSize      = 0;
+  this->metaData.origin = {0.0f, 0.0f, 0.0f};
+
+  // Where the MHD file itself lives. An MHD normally names its raw file relative to itself, so
+  // this is what such a name has to be resolved against -- noted before the parse loop, which
+  // replaces the path with the data file's.
+  auto const mhdDirectory = this->volumeDataFilePath.parent_path();
+
   char requiredEntriesGiven = 0x0;
   std::string line;
   while (std::getline(mhdFile, line)) {
@@ -90,7 +103,14 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
         throw std::runtime_error("Only three-dimensional images are permitted.");
       }
     } else if (key == "Offset") {
-      impl::checkValues<0x04>(values.front(), this->offset, requiredEntriesGiven);
+      // The image origin: the world coordinate of the first voxel, in the same unit as the
+      // spacing. A scan whose reconstruction volume is centred on the rotation axis has a negative
+      // origin on every axis, so the positivity check has to be off for this one.
+      impl::checkValues<0x04, float, 3, false>(values, this->metaData.origin, requiredEntriesGiven);
+    } else if (key == "HeaderSize") {
+      // Optional: how many bytes of the raw file to skip before the voxels start. Absent means the
+      // file is nothing but voxels.
+      impl::parseNumeric<std::int64_t>(values.front(), this->headerSize);
     } else if (key == "ElementSpacing") {
       impl::checkValues<0x08>(values, this->metaData.spacing, requiredEntriesGiven);
     } else if (key == "DimSize") {
@@ -108,7 +128,12 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
       this->metaData.voxelType = it->second;
       requiredEntriesGiven |= 0x20;
     } else if (key == "ElementDataFile") {
-      this->volumeDataFilePath = values.front();
+      // Resolved against the directory holding the MHD, not against the working directory of
+      // whoever is running. Almost every MHD in the wild names its raw file as a bare filename
+      // sitting next to it, and resolving that against the process's current directory would make
+      // reading such a pair depend on where the command happened to be issued from.
+      std::filesystem::path dataFile = values.front();
+      this->volumeDataFilePath = dataFile.is_absolute() ? dataFile : mhdDirectory / dataFile;
       requiredEntriesGiven |= 0x40;
     } else {
       // Additional potentially valid but ignored MHD key-value pair.
@@ -126,7 +151,7 @@ void parallel_mesh_extractor::SliceChunkedMHDIO::ReadMetaDataImpl() {
   
   std::uintmax_t const dataSize     = std::filesystem::file_size(this->volumeDataFilePath);
   std::uintmax_t const expectedSize = 
-    this->metaData.GetNumberOfVoxels() * this->metaData.GetElementSizeInBytes() + this->offset;
+    this->metaData.GetNumberOfVoxels() * this->metaData.GetElementSizeInBytes() + this->headerSize;
 
   if (dataSize != expectedSize) {
     throw std::runtime_error("Meta data does not match the size of the data file.");
@@ -149,7 +174,7 @@ Buffer parallel_mesh_extractor::SliceChunkedMHDIO::ReadSlicesImpl(unsigned int b
 
 
   std::ifstream mhdFile{this->volumeDataFilePath, std::ios::binary};
-  if (!mhdFile.seekg(this->offset + begin * sliceSizeBytes, std::ios::beg)) {
+  if (!mhdFile.seekg(this->headerSize + begin * sliceSizeBytes, std::ios::beg)) {
     return nullptr;
   }
 
