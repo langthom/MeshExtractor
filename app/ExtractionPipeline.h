@@ -80,6 +80,11 @@ namespace parallel_mesh_extractor {
     std::uint64_t Vertices = 0;
     std::uint64_t Triangles = 0;
 
+    /// Triangles that collapsed to a line or a point when their corners welded together, and were
+    /// therefore left out of the mesh. Anything but a handful of these says the isovalue coincides
+    /// with a value the data actually takes.
+    std::uint64_t DegenerateTriangles = 0;
+
     std::uint32_t SlabSlices = 0;
     std::uint64_t SlabBytes = 0;
 
@@ -429,6 +434,7 @@ namespace parallel_mesh_extractor {
 
     report.Vertices  = writer.VertexCount();
     report.Triangles = writer.TriangleCount();
+    report.DegenerateTriangles = assembler.DroppedTriangleCount();
     report.SpilledToDisk = writer.SpilledToDisk();
     return report;
   }

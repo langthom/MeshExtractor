@@ -28,10 +28,15 @@ namespace parallel_mesh_extractor {
   /// coordinates, exactly as the extraction produces them; scaling to millimetres belongs after
   /// the welding, not before it.
   ///
-  /// Where the data puts a corner value exactly on the isovalue, several grid edges interpolate to
-  /// the same point, and merging by position then collapses them into one vertex -- turning the
-  /// triangles between them into degenerate ones. That is the honest consequence of welding by
-  /// position and matches what the extraction already does with such data.
+  /// Where the data puts a corner value exactly on the isovalue -- the normal case for integer
+  /// volumes whose isovalue is an integer too -- several grid edges interpolate to that same
+  /// corner, and merging by position collapses them into one vertex. The triangles spanning two of
+  /// them are then a line or a point. Those are dropped, and a vertex no surviving triangle refers
+  /// to is never emitted, so the mesh carries neither degenerate faces nor orphan vertices.
+  ///
+  /// Dropping them takes nothing away: a collapsed triangle has no area and no orientation, and
+  /// its two non-self edges are one edge traversed both ways, which cancel. The surface stays as
+  /// closed as it was, pinched at that vertex -- which is a shape Marching Cubes produces anyway.
   class MeshAssembler {
   public:
 
@@ -41,6 +46,10 @@ namespace parallel_mesh_extractor {
     /// positions not seen before and the chunk's triangles as three global indices each. The
     /// global index of a vertex is its position in the concatenation of every "newVertices" handed
     /// out so far, so a caller writing them out in order needs no further bookkeeping.
+    ///
+    /// Triangles that collapse on welding are counted and then left out of both, so the two
+    /// outputs stay consistent: every vertex handed back is referenced, and every index handed
+    /// back addresses a vertex handed back now or earlier.
     void Add(ChunkMesh const& chunkMesh,
              std::vector<std::array<float, 3>>& newVertices,
              std::vector<std::uint32_t>& faceIndices);
@@ -58,6 +67,12 @@ namespace parallel_mesh_extractor {
     std::uint64_t VertexCount() const { return this->EmittedVertices; }
     std::uint64_t TriangleCount() const { return this->EmittedTriangles; }
 
+    /// Triangles that collapsed on welding and were dropped. Worth reporting: a run where this is
+    /// a noticeable share of the mesh is one whose isovalue sits exactly on a value the data takes,
+    /// and moving it off that value gives a better surface than discarding the collapsed parts of
+    /// this one does.
+    std::uint64_t DroppedTriangleCount() const { return this->DroppedTriangles; }
+
     /// How many vertices the merge cache is currently holding. Of no use to a caller, but it is
     /// the only way to observe that pruning does anything.
     std::size_t CachedVertexCount() const { return this->Lookup.size(); }
@@ -74,6 +89,12 @@ namespace parallel_mesh_extractor {
 
     std::uint64_t EmittedVertices = 0;
     std::uint64_t EmittedTriangles = 0;
+    std::uint64_t DroppedTriangles = 0;
+
+    /// Marks a chunk vertex that has not been given a global index yet, because no surviving
+    /// triangle has asked for it. Spending the last representable index on it caps the mesh one
+    /// vertex below what the output format could address, which Add reports rather than wraps.
+    static constexpr std::uint32_t Unassigned = 0xFFFFFFFFu;
 
     /// Scratch for the chunk local to global index mapping, kept across calls so that merging a
     /// few thousand chunks does not allocate a few thousand times.

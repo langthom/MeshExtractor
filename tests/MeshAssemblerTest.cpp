@@ -123,18 +123,96 @@ TEST_CASE("The two encodings of zero describe the same vertex") {
   CHECK(assembler.VertexCount() == 5);
 }
 
-TEST_CASE("A chunk repeating a position internally collapses it") {
-  // Where a corner value lands exactly on the isovalue, several grid edges interpolate to the same
-  // point. Welding by position merges them, which is the honest consequence of welding by position
-  // and leaves the triangle between them degenerate rather than leaving a hole.
+// --------------------------------- triangles that collapse ----------------------------------- //
+
+TEST_CASE("A triangle whose corners weld together is dropped rather than emitted degenerate") {
+  // Where a corner value lands exactly on the isovalue -- the rule for an integer volume read at
+  // an integer isovalue -- several grid edges interpolate to that same corner, and welding merges
+  // them. The triangle between them is then a line, carries no surface, and is left out.
   pme::MeshAssembler assembler;
 
   auto const mesh = meshOf({{4, 4, 4}, {4, 4, 4}, {5, 4, 4}}, {0, 1, 2});
   auto const emitted = add(assembler, mesh);
 
-  CHECK(emitted.Vertices.size() == 2);
-  CHECK(emitted.Indices == std::vector<std::uint32_t>{0, 0, 1});
+  CHECK(emitted.Indices.empty());
+  CHECK(assembler.TriangleCount() == 0);
+  CHECK(assembler.DroppedTriangleCount() == 1);
+
+  INFO("a vertex no surviving triangle refers to has no business in the file either");
+  CHECK(emitted.Vertices.empty());
+  CHECK(assembler.VertexCount() == 0);
+}
+
+TEST_CASE("Dropping a collapsed triangle leaves its neighbours untouched") {
+  // The collapsed triangle sits between two intact ones and shares vertices with both, so this
+  // pins down that only the triangle goes and none of the geometry around it.
+  pme::MeshAssembler assembler;
+
+  auto const mesh = meshOf({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}},
+                           {0, 1, 2,      // intact
+                            1, 3, 3,      // collapses onto the edge 1-3
+                            1, 3, 2});    // intact
+  auto const emitted = add(assembler, mesh);
+
+  CHECK(emitted.Vertices.size() == 4);
+  CHECK(emitted.Indices == std::vector<std::uint32_t>{0, 1, 2, 1, 3, 2});
+  CHECK(assembler.TriangleCount() == 2);
+  CHECK(assembler.DroppedTriangleCount() == 1);
+}
+
+TEST_CASE("Corners that collapse across chunks are dropped too") {
+  // The two corners are distinct within the chunk and only become one vertex through the weld, so
+  // the test has to run through the assembler rather than through the chunk's own indexing.
+  pme::MeshAssembler assembler;
+
+  auto const first = meshOf({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}, {0, 1, 2});
+  add(assembler, first);
+
+  // Two of the chunk's own positions hold the same point. They are separate vertices as far as the
+  // chunk is concerned, and only the weld makes the triangle's last two corners one and the same.
+  auto const second = meshOf({{1, 0, 0}, {0, 1, 0}, {0, 1, 0}}, {0, 1, 2});
+  auto const emitted = add(assembler, second);
+
+  CHECK(emitted.Vertices.empty());
+  CHECK(emitted.Indices.empty());
   CHECK(assembler.TriangleCount() == 1);
+  CHECK(assembler.DroppedTriangleCount() == 1);
+}
+
+TEST_CASE("A collapsed triangle does not open the surface it was part of") {
+  // Dropping the triangle has to leave the mesh as closed as it was: its two non-self edges are
+  // one edge traversed both ways and cancel against each other, so no boundary appears.
+  pme::MeshAssembler assembler;
+  pme::ChunkMesh assembled;
+
+  // A tetrahedron, with one extra triangle pinched flat against one of its edges.
+  auto const mesh = meshOf({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
+                           {0, 2, 1,
+                            0, 1, 3,
+                            0, 3, 2,
+                            1, 2, 3,
+                            1, 3, 3});
+  appendEmitted(assembled, add(assembler, mesh));
+
+  REQUIRE(assembled.TriangleCount() == 4);
+
+  auto const report = ma::analyzeManifold(assembled);
+  CHECK(report.IsWatertight);
+  CHECK(report.IsManifold);
+  CHECK(report.IsConsistentlyOriented);
+  CHECK(ma::eulerCharacteristic(assembled) == 2);
+}
+
+TEST_CASE("The two encodings of zero collapse a triangle just as an exact repeat does") {
+  // Welding normalises -0.0 onto +0.0, so the collapse test has to use the same normalisation or
+  // it would pass a triangle through that the weld then turns degenerate anyway.
+  pme::MeshAssembler assembler;
+
+  auto const mesh = meshOf({{0.0f, 1.0f, 2.0f}, {-0.0f, 1.0f, 2.0f}, {5, 5, 5}}, {0, 1, 2});
+  auto const emitted = add(assembler, mesh);
+
+  CHECK(emitted.Indices.empty());
+  CHECK(assembler.DroppedTriangleCount() == 1);
 }
 
 // -------------------------------------- pruning the cache ------------------------------------ //

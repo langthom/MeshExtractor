@@ -146,8 +146,19 @@ int main(int argc, char** argv) {
               << "Chunks    " << report.Chunks << " survived the culling, "
               << report.ChunksExtracted << " produced geometry\n"
               << "Mesh      " << report.Vertices << " vertices, " << report.Triangles << " triangles"
-              << (settings.VoxelCoordinates ? " in voxel coordinates\n" : "\n")
-              << "Wrote     " << output << " in " << std::fixed << std::setprecision(2)
+              << (settings.VoxelCoordinates ? " in voxel coordinates\n" : "\n");
+
+    if (report.DegenerateTriangles > 0) {
+      // Worth saying out loud rather than hiding: these appear when the isovalue is exactly a
+      // value the data takes, which for an integer volume and an integer isovalue is the rule
+      // rather than the exception. They carry no surface, so leaving them out costs nothing, but a
+      // large count is a hint that half a unit off the isovalue would give a cleaner mesh.
+      std::cout << "Dropped   " << report.DegenerateTriangles
+                << " collapsed triangles (isovalue lies exactly on a value in the data;\n"
+                << "          offsetting it by half a unit avoids them)\n";
+    }
+
+    std::cout << "Wrote     " << output << " in " << std::fixed << std::setprecision(2)
               << elapsed.count() << " s\n";
 
     auto const& timing = report.Timing;
